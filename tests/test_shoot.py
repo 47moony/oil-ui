@@ -49,6 +49,21 @@ class ShootCLITests(unittest.TestCase):
         self.assertNotIn("fill=type", result.stdout)
         self.assertIn("不进入 iframe 或 Shadow DOM", result.stdout)
         self.assertIn("中心点遮挡和禁用状态", result.stdout)
+        self.assertIn("显式 --zoom 按倍数截每个状态", result.stdout)
+
+    def test_evidence_documentation_and_report_structure_example(self):
+        documentation = (ROOT / 'references/tools.md').read_text(encoding='utf-8')
+        self.assertIn('最外层是数组', documentation)
+        self.assertIn('不是把页面放大到 200% 后的重排', documentation)
+        self.assertIn('录屏短于 3 秒是正常的', documentation)
+        self.assertIn('frames.start/mid/end', documentation)
+        example = documentation.split('结构示意：', 1)[1].split('```json\n', 1)[1].split('```', 1)[0].strip()
+        self.assertEqual(len(example.splitlines()), 2)
+        report = json.loads(example)
+        self.assertIsInstance(report, list)
+        self.assertIn('lint', report[0])
+        self.assertIn('motion', report[1])
+        self.assertTrue(all('issues' in entry for entry in report))
 
     def test_missing_target(self):
         result = subprocess.run([NODE, str(SCRIPT)], cwd=ROOT,
@@ -383,6 +398,103 @@ document.querySelector('#go').onclick = () => show(document.body.dataset.state =
         if shutil.which("ffmpeg"):
             self.assertTrue((output / "record.mp4").is_file(), result.stdout + result.stderr)
             self.assert_artifacts(output, ("record.mp4",))
+
+    def frame_pixel(self, path, x=20, y=20):
+        result = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(path), '-vf',
+                                 f'format=rgb24,crop=1:1:{x}:{y}', '-frames:v', '1',
+                                 '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(len(result.stdout), 3)
+        return tuple(result.stdout)
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed to inspect frame pixels')
+    def test_record_frames_follow_last_action_and_capture_short_feedback(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+body{margin:0}#box{position:absolute;left:20px;top:20px;width:120px;height:120px;background:red}
+#box.prepared{background:lime}#box.feedback{animation:shake .36s linear}
+@keyframes shake{0%,100%{background:red;transform:none}50%{background:blue;transform:translateX(40px)}}
+#controls{position:absolute;top:180px}#drag{display:inline-block;width:80px;height:30px}
+#tail:hover{animation:tail .8s linear}@keyframes tail{from{opacity:.3}to{opacity:1}}
+@keyframes loop{to{transform:rotate(360deg)}}#loop{position:absolute;top:270px;width:40px;height:40px;background:gray;animation:loop 2s linear infinite}
+</style><div id="box"></div><div id="controls"><button id="prepare">Prepare</button>
+<button id="click">Click</button><button id="double">Double</button><div id="drag">Drag</div>
+<input id="edit" value="old"><select id="choice"><option value="a">A</option><option value="b">B</option></select>
+<button id="tail">Tail</button></div><div id="loop"></div><script>
+const box=document.querySelector('#box');
+const feedback=()=>{box.className='feedback'};
+document.querySelector('#prepare').onclick=()=>box.className='prepared';
+document.querySelector('#click').onclick=feedback;
+document.querySelector('#double').ondblclick=feedback;
+document.querySelector('#drag').onmouseup=feedback;
+document.querySelector('#edit').oninput=feedback;
+document.querySelector('#choice').onchange=feedback;
+addEventListener('keydown',e=>{if(e.key==='Enter')feedback()});
+</script>''')
+        actions = [('click #click', 'click'), ('dblclick #double', 'dblclick'),
+                   ('drag #drag 20 0', 'drag'), ('type #edit X', 'type'),
+                   ('fill #edit replacement', 'fill'), ('select #choice b', 'select'), ('key Enter', 'key')]
+        for raw, action in actions:
+            with self.subTest(action=action):
+                output = self.folder / action
+                self.shoot(output, '--size', 'desktop', '--record', '--wait', '0', '--hold', '100',
+                           '--steps', f'click #prepare; wait 700; {raw}; wait 500; hover #tail; scroll 0')
+                entry = json.loads((output / 'report.json').read_text())[0]
+                self.assertEqual(entry['sampling'], {'mode': 'action', 'step': 3, 'action': action, 'raw': raw})
+                self.assertEqual(entry['issues'], [])
+                frames = entry['frames']
+                self.assertGreater(frames['start']['timeMs'], 1000)
+                self.assertLess(frames['start']['timeMs'], frames['mid']['timeMs'])
+                self.assertLess(frames['mid']['timeMs'], frames['end']['timeMs'])
+                self.assertEqual(frames['end']['timeMs'], entry['durationMs'])
+                self.assertGreater(frames['end']['timeMs'] - frames['mid']['timeMs'], 500)
+                before = self.frame_pixel(output / frames['start']['file'], 80, 80)
+                middle = self.frame_pixel(output / frames['mid']['file'], 80, 80)
+                after = self.frame_pixel(output / frames['end']['file'], 80, 80)
+                self.assertGreater(before[1], 220, before)
+                self.assertLess(before[0], 40, before)
+                self.assertGreater(middle[2], 170, middle)
+                self.assertLess(middle[0], 100, middle)
+                self.assertGreater(after[0], 220, after)
+                self.assertLess(after[2], 40, after)
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed to inspect frame pixels')
+    def test_entry_frames_span_content_to_stable_and_short_recording_is_valid(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+body{margin:0;background:#ffd000}#box{width:200px;height:200px;background:blue;animation:appear .6s linear both}
+@keyframes appear{from{opacity:0}to{opacity:1}}
+</style><div id="box"></div>''')
+        output = self.folder / 'entry-timing'
+        self.shoot(output, '--record', '--entry', '--wait', '0', '--hold', '50')
+        entry = json.loads((output / 'report.json').read_text())[0]
+        self.assertEqual(entry['sampling'], {'mode': 'entry'})
+        frames = entry['frames']
+        self.assertLess(frames['start']['timeMs'], frames['mid']['timeMs'])
+        self.assertLess(frames['mid']['timeMs'], frames['end']['timeMs'])
+        self.assertEqual(frames['end']['timeMs'], entry['durationMs'])
+        self.assertLess(entry['durationMs'], 3000)
+        self.assertGreater(entry['durationMs'], 600)
+        first = self.frame_pixel(output / 'record.mp4')
+        self.assertTrue(all(channel > 245 for channel in first), first)
+        start = self.frame_pixel(output / frames['start']['file'])
+        middle = self.frame_pixel(output / frames['mid']['file'])
+        end = self.frame_pixel(output / frames['end']['file'])
+        self.assertGreater(start[0], middle[0] + 30, (start, middle))
+        self.assertGreater(middle[0], end[0] + 30, (middle, end))
+        self.assertLess(end[0], 20, end)
+        self.assertGreater(end[2], 230, end)
+
+    def test_record_without_changing_actions_keeps_head_middle_tail_sampling(self):
+        output = self.folder / 'no-action-timing'
+        self.shoot(output, '--record', '--steps', 'wait 200; hover #go', '--hold', '100')
+        entry = json.loads((output / 'report.json').read_text())[0]
+        self.assertEqual(entry['sampling'], {'mode': 'recording'})
+        frames = entry['frames']
+        self.assertEqual(frames['start']['timeMs'], 0)
+        self.assertLessEqual(frames['start']['timeMs'], frames['mid']['timeMs'])
+        self.assertLessEqual(frames['mid']['timeMs'], frames['end']['timeMs'])
+        self.assertLessEqual(frames['end']['timeMs'], entry['durationMs'])
+        self.assertEqual((output / frames['start']['file']).read_bytes(), (output / frames['end']['file']).read_bytes())
 
     def test_mask_preserves_current_color_icons(self):
         self.page.write_text('''<!doctype html><html><head>
@@ -820,12 +932,56 @@ document.querySelector('#go').addEventListener('click',()=>{if(document.body.dat
                                       "record-toggle.mp4", "motion-toggle-start.jpg", "motion-toggle-mid.jpg", "motion-toggle-end.jpg"))
         report = json.loads((output / "report.json").read_text())
         self.assertTrue(any(r["file"] == "motion-probe-toggle" for r in report))
+        self.assertFalse((output / 'b-@2x.png').exists(), 'Default evidence still gives only the first state a 2x shot')
         failed = self.folder / "partial"
         result = self.run_failure(failed, "--evidence", "--hold=100", "--steps", "broken: click .missing", "--steps", "good: click #go")
         self.assert_artifacts(failed, ("page.png", "page-@2x.png", "record-entry.mp4", "record-good.mp4", "report.json"))
         report = json.loads((failed / "report.json").read_text())
         self.assertEqual(sum(r.get("failed", False) for r in report), 2)
         self.assertIn("失败", result.stdout)
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed for complete evidence')
+    def test_evidence_explicit_zooms_cover_each_state_and_entry_starts_blank(self):
+        import struct
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+body{margin:0;background:#223344}#box{width:120px;height:120px;background:blue;animation:appear .36s linear both}
+@keyframes appear{from{opacity:0}to{opacity:1}}#go{position:absolute;top:200px}
+</style><div id="box"></div><button id="go">Change</button><script>
+if(innerWidth!==800 || innerHeight!==600)console.error('zoom-changed-layout');
+if(new URLSearchParams(location.search).get('state')==='b')document.body.style.background='#441122';
+document.querySelector('#go').onclick=()=>document.body.style.background='#151515';
+</script>''')
+        for option, zooms in [('--zoom=1', [1]), ('--zoom=1,2', [1, 2]), ('--zoom=2,3', [2, 3])]:
+            with self.subTest(option=option):
+                output = self.folder / ('evidence-' + '-'.join(map(str, zooms)))
+                self.shoot(output, '--evidence', '--states', 'a,b', '--size', '800x600', option,
+                           '--hold', '50', '--steps', 'change: click #go')
+                report = json.loads((output / 'report.json').read_text())
+                shots = [entry for entry in report if entry['file'].endswith('.png')]
+                self.assertEqual([(entry['zoom'], entry['state']) for entry in shots],
+                                 [(zoom, state) for zoom in zooms for state in ['a', 'b']])
+                self.assertTrue(all(entry['issues'] == [] for entry in shots), shots)
+                for zoom in zooms:
+                    suffix = '' if zoom == 1 else f'-@{zoom}x'
+                    for state in ['a', 'b']:
+                        name = f'{state}{suffix}.png'
+                        dimensions = struct.unpack('>II', (output / name).read_bytes()[16:24])
+                        self.assertEqual(dimensions, (800 * zoom, 600 * zoom))
+                        self.assert_artifacts(output, (name, f'{state}{suffix}-masked.png'))
+                    # Single-zoom sheets keep their existing names.
+                    sheet_suffix = suffix if len(zooms) > 1 else ''
+                    self.assert_artifacts(output, (f'sheet{sheet_suffix}.png', f'sheet{sheet_suffix}-masked.png'))
+                if 1 not in zooms:
+                    self.assertFalse((output / 'a.png').exists())
+                if 2 not in zooms:
+                    self.assertFalse((output / 'a-@2x.png').exists())
+                entry = next(item for item in report if item.get('group') == 'entry')
+                self.assertEqual(entry['sampling']['mode'], 'entry')
+                first = self.frame_pixel(output / 'record-entry.mp4')
+                self.assertTrue(all(channel > 245 for channel in first), first)
+                # Content frames must belong to the new page, not the previous dark completed page.
+                self.assertNotEqual(self.frame_pixel(output / entry['frames']['start']['file']), (21, 21, 21))
+                self.assertEqual(list(output.glob('frames*')), [])
 
     def test_browser_timeout_retries_once(self):
         if sys.platform == 'win32':

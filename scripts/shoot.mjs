@@ -20,18 +20,18 @@ const HELP = `常用命令：
   --states <a,b,...>    依次用 ?state=<名字> 打开并各截一张
   --param <名字>        状态参数名，默认 state
   --query <查询参数>    给地址加参数，例如 --query "a=1&b=2"；可和 --states 一起用
-  --zoom <倍数,...>     默认 1；例如 --zoom 1,2，每个倍数各出一套
+  --zoom <倍数,...>     默认 1；例如 --zoom 1,2，每个倍数各出一套；配 --evidence 时覆盖默认截图倍数
   --full                截整页，默认只截视口
   --mask                另截一份遮掉全部文字的版本
   --sheet               把状态拼成并排图，配合 --mask 再拼遮字版
   --mark "1=<选择器>;..." 给匹配的元素画框和编号，另出标注版；不写编号时按顺序编号
   --steps "<动作>"      可写多次，每组从重新打开的页面开始；可起名："open: click .open"
-  --record              每组录屏并留三帧；单个无名组沿用 record.mp4、motion-start/mid/end.jpg
+  --record              每组录屏并留最后一个变化动作的三帧；无名组沿用 record.mp4、motion-start/mid/end.jpg
   --entry               配合 --record，先开录再打开页面，录首次出场
   --hold <毫秒>         动作结束后再录多久，默认 1200
   --motion              探测首次进入、动作反馈、首屏滚动和从头滚到底的动效；单屏跳过滚动
   --evidence            一次取齐状态截图、并排图和遮字并排图、首状态 2 倍图、动效探测、
-                        首次出场录屏和每组动作录屏；一项失败仍继续其他项
+                        首次出场录屏和每组动作录屏；显式 --zoom 按倍数截每个状态；一项失败仍继续
   --compare <参考图>    截图与 png/jpg/webp 参考图出四格对比和九宫格差异报告
   --wait <毫秒>         页面加载后等待时间，默认 400；截图另等有限动画，最多 2 秒
   --dry-run             只检查选项和动作写法，输出解析 JSON，不启动浏览器
@@ -162,7 +162,7 @@ if (!args.length || args.includes("--help") || args.includes("-h")) { console.lo
 const opt = { out: "shots", size: "390x844", param: "state", zoom: "1", hold: "1200", wait: "400" };
 const options = [...HELP.matchAll(/^  (--\S+)/gm)].map((m) => m[1]);
 const booleanOptions = new Set(["full", "mask", "sheet", "record", "motion", "entry", "evidence", "dry-run", "force"]);
-const flags = new Set(), stepsInputs = [], positional = [];
+const flags = new Set(), stepsInputs = [], positional = [], suppliedOptions = new Set();
 let lastFlag = null;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
@@ -183,6 +183,7 @@ for (let i = 0; i < args.length; i++) {
       if (equal < 0 && (i + 1 >= args.length || args[i + 1].startsWith("--"))) fail(`${option} 需要一个值`);
       const value = equal < 0 ? args[++i] : a.slice(equal + 1);
       if (!value) fail(`${option} 需要一个值，收到 ${a}；例如 ${option} 值`);
+      suppliedOptions.add(key);
       if (key === "steps") stepsInputs.push(value); else opt[key] = value;
     }
   } else {
@@ -456,7 +457,7 @@ async function setViewport(w, h, scale) {
   await cdp("Emulation.setTouchEmulationEnabled", { enabled: w < 600 });
 }
 
-async function open(url) {
+async function open(url, wait = Number(opt.wait)) {
   return during(`${currentContext} / 打开页面 ${url}`, async () => {
     let loadedListener, timer;
     const loaded = new Promise((ok) => {
@@ -469,7 +470,7 @@ async function open(url) {
       if (nav.errorText) throw new Error(`打不开 ${url}：${nav.errorText}`);
       await loaded;
       await evaluate(`document.fonts ? document.fonts.ready.then(() => true) : true`);
-      await sleep(Number(opt.wait));
+      await sleep(wait);
     } finally {
       clearTimeout(timer); const index = listeners.indexOf(loadedListener); if (index >= 0) listeners.splice(index, 1);
     }
@@ -943,11 +944,12 @@ async function locate(selector, context, scroll = true, action = "click", params
 }
 const KEYS = { ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Enter: 13, Escape: 27, Tab: 9, " ": 32, Space: 32, Home: 36, End: 35, PageUp: 33, PageDown: 34, Backspace: 8, Delete: 46 };
 const mouse = (type, x, y, extra = {}) => cdp("Input.dispatchMouseEvent", { type, x, y, button: "left", pointerType: "mouse", ...extra });
-async function runSteps(steps = []) {
+async function runSteps(steps = [], observer = {}) {
   for (const [i, step] of steps.entries()) {
     const { action, selector, params } = step;
     const context = `第 ${i + 1} 步「${step.raw}」`;
     await during(`${currentContext} / ${context}`, async () => {
+      await observer.step?.(step, i);
       if (action === "wait") { await sleep(params.ms); return; }
       if (action === "waitfor") {
         const end = Date.now() + 5000;
@@ -961,6 +963,7 @@ async function runSteps(steps = []) {
         const p = await locate(selector, context, true, action, params);
         await mouse("mouseMoved", p.x, p.y);
         if (action === "hover") { await sleep(200); return; }
+        await observer.before?.(step, i);
         await mouse("mousePressed", p.x, p.y, { clickCount: 1, buttons: 1 });
         if (action === "drag") {
           for (let n = 1; n <= 24; n++) { await mouse("mouseMoved", p.x + params.dx * n / 24, p.y + params.dy * n / 24, { buttons: 1 }); await sleep(16); }
@@ -971,9 +974,11 @@ async function runSteps(steps = []) {
             await mouse("mousePressed", p.x, p.y, { clickCount: 2 }); await mouse("mouseReleased", p.x, p.y, { clickCount: 2 });
           }
         }
+        await observer.after?.(step, i);
         await sleep(120);
       } else if (["type", "fill", "select"].includes(action)) {
         await locate(selector, context, false, action, params);
+        await observer.before?.(step, i);
         await evaluate(`(() => {
           const el = (${findSource})(${JSON.stringify(selector)})[0];
           el.focus();
@@ -995,14 +1000,17 @@ async function runSteps(steps = []) {
           return true;
         })()`);
         if (action === "type") await cdp("Input.insertText", { text: params.text });
+        await observer.after?.(step, i);
         await sleep(120);
       } else if (action === "key") {
         const modifiers = params.modifiers.reduce((n, k) => n | ({ Alt: 1, Control: 2, Meta: 4, Shift: 8, ControlOrMeta: process.platform === "darwin" ? 4 : 2 })[k], 0);
         const key = params.key === "Space" ? " " : params.key;
         const code = KEYS[params.key] ?? key.toUpperCase().charCodeAt(0);
         const event = { key, code: /^[a-z]$/i.test(key) ? `Key${key.toUpperCase()}` : /^\d$/.test(key) ? `Digit${key}` : params.key, windowsVirtualKeyCode: code, modifiers };
+        await observer.before?.(step, i);
         await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...event, ...(modifiers & 4 && key.toLowerCase() === "a" ? { commands: ["selectAll"] } : {}) });
-        await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...event }); await sleep(80);
+        await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...event });
+        await observer.after?.(step, i); await sleep(80);
       } else if (action === "scroll") { await evaluate(`scrollBy(0, ${params.dy}), true`); await sleep(200); }
     });
   }
@@ -1106,54 +1114,137 @@ function runFfmpeg(args, timeout) {
 }
 
 // ---------- 录屏 ----------
+// Keep finite animation intervals even after a short feedback has finished. Runs before page scripts.
+function recordTiming() {
+  let baseline = new Set(), start = null, end = null, raf, active = true;
+  function sample() {
+    for (const a of document.getAnimations()) {
+      if (baseline.has(a) || !a.effect || !a.playbackRate || typeof a.startTime !== "number") continue;
+      const timing = a.effect.getComputedTiming(), rate = a.playbackRate;
+      if (!Number.isFinite(timing.endTime) || a.playState === "paused" || !["DocumentTimeline", undefined].includes(a.timeline?.constructor.name)) continue;
+      const zero = performance.timeOrigin + a.startTime;
+      const first = Math.min(zero + timing.delay / rate, zero + timing.endTime / rate);
+      const last = Math.max(zero + timing.delay / rate, zero + timing.endTime / rate);
+      start = start === null ? first : Math.min(start, first);
+      end = end === null ? last : Math.max(end, last);
+    }
+  }
+  function tick() { if (!active) return; sample(); raf = requestAnimationFrame(tick); }
+  window.__oilRecordTiming = {
+    reset() { baseline = new Set(document.getAnimations()); start = end = null; },
+    read() { if (active) sample(); return { start, end }; },
+    stop() { active = false; cancelAnimationFrame(raf); },
+  };
+  tick();
+}
 async function record(url, w, h, { steps = [], name = "", entry = flags.has("entry"), zoom = zooms[0] } = {}) {
   const video = `record${name ? "-" + name : ""}.mp4`;
   const motion = `motion${name ? "-" + name : ""}`;
   const frames = [];
   const dir = join(out, name ? `frames-${name}` : "frames");
   mkdirSync(dir, { recursive: true }); temporaryFrames.add(dir);
+  let identifier, actionStart, actionEnd, beforeAction, painted = 0;
+  const lastAction = steps.findLastIndex((s) => ["click", "dblclick", "drag", "type", "fill", "select", "key"].includes(s.action));
+  const captureFrame = async (label) => {
+    const { data } = await cdp("Page.captureScreenshot", { format: "jpeg", quality: 88 });
+    const frame = { name: join(dir, `${label}.jpg`), t: Date.now() / 1000 };
+    writeFileSync(frame.name, Buffer.from(data, "base64")); return frame;
+  };
   const onFrame = (m) => {
     if (transportFailure || m.sessionId !== sessionId || m.method !== "Page.screencastFrame") return;
     const name = join(dir, `f${String(frames.length).padStart(4, "0")}.jpg`);
     writeFileSync(name, Buffer.from(m.params.data, "base64"));
-    frames.push({ name, t: m.params.metadata.timestamp });
+    frames.push({ name, t: Math.max(frames.at(-1)?.t || 0, m.params.metadata.timestamp) });
     cdp("Page.screencastFrameAck", { sessionId: m.params.sessionId }).catch(() => {});
   };
   try {
     await setViewport(w, h, zoom);
-    if (!entry) await open(url);
+    ({ identifier } = await cdp("Page.addScriptToEvaluateOnNewDocument", { source: `(${recordTiming.toString()})()` }));
+    if (entry) {
+      await open("about:blank", 0);
+      // Seed the video with a painted blank page, never the preceding evidence item.
+      frames.push(await captureFrame("blank"));
+    } else await open(url);
     listeners.push(onFrame);
     await cdp("Page.startScreencast", { format: "jpeg", quality: 88, everyNthFrame: 1 });
     if (entry) {
+      await sleep(50);
       await open(url);
-      // 丢掉页面第一次有内容之前的空白帧，开始帧就是出场的起点
-      const painted = await evaluate(`(() => { const p = performance.getEntriesByName("first-contentful-paint")[0] || performance.getEntriesByType("paint")[0]; return p ? (performance.timeOrigin + p.startTime) / 1000 : 0; })()`);
-      if (painted) { const firstPainted = frames.findIndex((f) => f.t >= painted - 0.02); if (firstPainted > 0) frames.splice(0, firstPainted); }
+      painted = await evaluate(`(() => { const p = performance.getEntriesByName("first-contentful-paint")[0] || performance.getEntriesByType("paint")[0]; return (performance.timeOrigin + (p?.startTime || 0)) / 1000; })()`);
     } else await sleep(500);
-    await runSteps(steps);
+    await runSteps(steps, {
+      step: async (step, i) => {
+        // A later hover or scroll can have its own animation; it is not this action's feedback.
+        if (lastAction >= 0 && i > lastAction && ["hover", "scroll"].includes(step.action)) await evaluate(`(__oilRecordTiming.stop(), true)`);
+      },
+      before: async (_, i) => {
+        if (i !== lastAction) return;
+        beforeAction = await captureFrame("before-action");
+        await evaluate(`(__oilRecordTiming.reset(), true)`);
+        actionStart = Date.now() / 1000;
+      },
+      after: async (_, i) => { if (i === lastAction) actionEnd = Date.now() / 1000; },
+    });
+    if (entry && lastAction < 0) await settleAnimations(2000);
     await sleep(Number(opt.hold));
     const finished = Date.now() / 1000;
+    const final = entry || lastAction >= 0 ? await captureFrame("hold-end") : null;
+    if (final) final.t = finished;
+    const feedback = await evaluate(`__oilRecordTiming.read()`);
     const issues = await check();
     await cdp("Page.stopScreencast");
     listeners.splice(listeners.indexOf(onFrame), 1);
     if (!frames.length) throw new Error("录屏没有拿到画面");
-    const pick = { start: frames[0], mid: frames[Math.floor(frames.length / 2)], end: frames[frames.length - 1] };
+    if (final) {
+      // The stream may deliver a frame from after --hold while checks are running.
+      while (frames.length > 1 && frames.at(-1).t > finished) frames.pop();
+      frames.push(final);
+    }
+    const nearest = (time, pool = frames) => pool.reduce((best, f) => Math.abs(f.t - time) < Math.abs(best.t - time) ? f : best);
+    let pick, sampling;
+    if (lastAction >= 0) {
+      const from = Math.max(actionStart, (feedback.start ?? actionStart * 1000) / 1000);
+      const to = Math.max(from, Math.min(finished, (feedback.end ?? (actionEnd * 1000 + 200)) / 1000));
+      const candidates = [...frames.filter((f) => f.t >= actionStart && f.t <= finished), final];
+      pick = { start: beforeAction, mid: nearest((from + to) / 2, candidates), end: final };
+      sampling = { mode: "action", step: lastAction + 1, action: steps[lastAction].action, raw: steps[lastAction].raw };
+    } else if (entry) {
+      const content = frames.filter((f) => f.t >= painted);
+      const from = content[0]?.t ?? final.t;
+      const to = Math.max(from, Math.min(finished, (feedback.end ?? finished * 1000) / 1000));
+      pick = { start: content[0] || final, mid: nearest((from + to) / 2, [...content, final]), end: final };
+      sampling = { mode: "entry" };
+    } else {
+      pick = { start: frames[0], mid: frames[Math.floor(frames.length / 2)], end: frames[frames.length - 1] };
+      sampling = { mode: "recording" };
+    }
     for (const [k, f] of Object.entries(pick)) writeFileSync(join(out, `${motion}-${k}.jpg`), readFileSync(f.name));
+    const frameReport = Object.fromEntries(Object.entries(pick).map(([k, f]) => [k, {
+      file: `${motion}-${k}.jpg`, timeMs: Math.max(0, Math.round((f.t - frames[0].t) * 1000)),
+    }]));
+    const details = { frames: frameReport, sampling, durationMs: Math.round((finished - frames[0].t) * 1000) };
     const ffmpeg = (await runFfmpeg(["-version"], 5000)).status === 0;
-    if (!ffmpeg) return { issues, failed: true, message: `录屏：没装 ffmpeg，只留了 ${motion}-start/mid/end.jpg 三帧` };
+    if (!ffmpeg) return { issues, ...details, failed: true, message: `录屏：没装 ffmpeg，只留了 ${motion}-start/mid/end.jpg 三帧` };
     // Generated basenames are safe for concat's quoting, even when --out contains an apostrophe.
     // Keep the final still frame through the end of --hold; screencasts only emit changed frames.
     const list = frames.map((f, i) => `file '${basename(f.name)}'\nduration ${Math.max(0.016, ((frames[i + 1]?.t ?? finished) - f.t)).toFixed(3)}`).join("\n") + `\nfile '${basename(frames.at(-1).name)}'\n`;
     writeFileSync(join(dir, "list.txt"), list);
     const r = await runFfmpeg(["-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", join(dir, "list.txt"),
       "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30", "-pix_fmt", "yuv420p", join(out, video)], 60000);
-    if (r.status !== 0) return { issues, failed: true, message: `录屏：ffmpeg 合成失败（${r.error?.code === "ETIMEDOUT" ? "60 秒内没有合成完成" : r.error?.message || r.stderr.trim().split("\n").pop()}），已保留 ${motion}-start/mid/end.jpg 三帧` };
+    if (r.status !== 0) return { issues, ...details, failed: true, message: `录屏：ffmpeg 合成失败（${r.error?.code === "ETIMEDOUT" ? "60 秒内没有合成完成" : r.error?.message || r.stderr.trim().split("\n").pop()}），已保留 ${motion}-start/mid/end.jpg 三帧` };
     rmSync(dir, { recursive: true, force: true });
-    return { issues, message: `录屏：${video}（${(finished - frames[0].t).toFixed(1)} 秒）和 ${motion}-start/mid/end.jpg` };
+    return { issues, ...details, message: `录屏：${video}（${(finished - frames[0].t).toFixed(1)} 秒）和 ${motion}-start/mid/end.jpg` };
   } finally {
     const index = listeners.indexOf(onFrame); if (index >= 0) listeners.splice(index, 1);
     try { if (!transportFailure) await cdp("Page.stopScreencast"); }
-    finally { rmSync(dir, { recursive: true, force: true }); temporaryFrames.delete(dir); }
+    finally {
+      try {
+        if (!transportFailure) {
+          await evaluate(`(window.__oilRecordTiming?.stop(), delete window.__oilRecordTiming, true)`);
+          if (identifier) await cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); temporaryFrames.delete(dir); }
+    }
   }
 }
 
@@ -1388,15 +1479,19 @@ async function recording(group, entry, zoom, multipleZooms = false) {
     problems = [];
     const result = await record(withState(states[0]), sizes[0].w, sizes[0].h, { name, steps: group.steps, entry, zoom });
     lines.push(result.message);
-    report.push({ file, ...meta, issues: result.issues, ...(result.failed ? { failed: true } : {}) });
+    report.push({ file, ...meta, issues: result.issues, frames: result.frames, sampling: result.sampling, durationMs: result.durationMs, ...(result.failed ? { failed: true } : {}) });
     if (evidence && result.failed) { report.at(-1).issues.push(result.message); process.exitCode = 1; }
   });
 }
 try {
   if (evidence) {
     const plain = [{ id: "", steps: [] }];
-    await captureBatch(states.map((_, i) => i), [1], plain, states.length > 1 || flags.has("mask"), states.length > 1);
-    await captureBatch([0], [2], plain, flags.has("mask"), false);
+    if (suppliedOptions.has("zoom")) {
+      await captureBatch(states.map((_, i) => i), zooms, plain, states.length > 1 || flags.has("mask"), states.length > 1);
+    } else {
+      await captureBatch(states.map((_, i) => i), [1], plain, states.length > 1 || flags.has("mask"), states.length > 1);
+      await captureBatch([0], [2], plain, flags.has("mask"), false);
+    }
     await motionBatch();
     // Avoid collisions with a user group named entry.
     let entryId = "entry";

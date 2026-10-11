@@ -11,7 +11,7 @@
 截图分两种用途，不要混在一起：
 
 - **看一眼**：改完一批，想看效果。只截当前这一屏，一条命令，不加 `--record`、`--motion`、`--mask` 和 `--sheet`。把一批改动攒在一起改完再截，不是每改一处截一次；页面没有变，就不重复截。
-- **取证**：用 `--evidence` 一次取齐状态图、并排图、遮字图、首状态 200% 截图、首次出场录屏、动作录屏和 `--motion` 探测。只在两个时候做：送评审之前，交付之前。方向首屏那一轮每个方向只截一张，不取证。
+- **取证**：用 `--evidence` 一次取齐状态图、并排图、遮字图、首状态 2 倍像素密度截图、首次出场录屏、动作录屏和 `--motion` 探测。只在两个时候做：送评审之前，交付之前。方向首屏那一轮每个方向只截一张，不取证。
 
 每一轮评审只重新取这一轮改动影响到的证据。没有动过的状态和动效，沿用上一轮的文件，交接时注明哪些是沿用的；拿不准有没有被影响到，例如改了共享样式，就重取那一项。动效只在新做或改过以后重新录，`--motion` 也只在动效有变化以后重跑。
 
@@ -29,7 +29,7 @@ node <skill>/scripts/shoot.mjs <页面地址或 HTML 文件> [选项]
 | 桌面单张 | `--size desktop`（1440x900） |
 | 每个状态各一张，再拼成并排图 | `--states idle,running,done,error --sheet` |
 | 同时要遮掉全部文字的版本 | 再加 `--mask` |
-| 1 倍和 200% 各一套 | `--zoom 1,2` |
+| 1 倍和 2 倍像素密度各一套 | `--zoom 1,2`；配 `--evidence` 时每个状态都按这些倍数截图 |
 | 手机和桌面各一套 | `--size phone,desktop`（desktop 是 1440x900，phone/mobile 是 390x844；可混用数字尺寸，默认仍是 390x844） |
 | 整页长图 | `--full` |
 | 给用户指出问题：在元素上画框、标编号 | `--mark "1=.page-head .btn; 2=.toggle-row" --full`，另出一张 `<状态>-marked.png` |
@@ -38,7 +38,7 @@ node <skill>/scripts/shoot.mjs <页面地址或 HTML 文件> [选项]
 | 给地址加查询参数 | `--query "a=1&b=2"` |
 | 先检查选项和动作写法，不开浏览器 | `--dry-run --steps "click text=More; wait450"`，标准输出是解析 JSON |
 | 主操作录屏，外加开始、中间、结束三帧 | `--record --steps "drag .handle 0 -80; wait 400; click .start" --hold 1500` |
-| 首次进入的出场录屏，从页面第一次有内容录起 | `--record --entry --hold 1500` |
+| 首次进入的出场录屏，空白 → 内容出现 → 到位 | `--record --entry --hold 1500` |
 | 动效探测：首次进入、主操作、从头滚到底各有没有动画、幅度多大 | `--motion --size 1440x900 --steps "click .primary"` |
 | 截图还原：和参考图并排、叠加，出差异热图 | `--compare 参考.png --size <参考的逻辑尺寸>` |
 
@@ -64,9 +64,20 @@ node <skill>/scripts/shoot.mjs <页面地址或 HTML 文件> [选项]
 
 `--steps` 可以写多次。组名写在开头，格式是字母数字、下划线或连字符，加冒号和空格，例如 `open: click .open`；动作名不能当组名。每组都从重新打开的页面开始。没有名字的多组按 1、2、3 编号。选项可以写成 `--名字=值` 或 `--名字 值`，`--motion`、`--record` 等开关不带参数。
 
-`--evidence` 依次截每个状态的 1 倍图，两个以上状态时再出并排图和遮字并排图；再截第一个状态的 2 倍图、探测动效、录首次进入的出场、录每组动作。首次出场用 `record-entry.mp4` 和 `motion-entry-start/mid/end.jpg`，动作组名为 entry 时出场改用 entry-appearance；名字仍冲突时继续加 -appearance。所有结果进同一个目录和 report.json。一项执行失败会写进汇总，继续其他项，返回码为 1。每组录屏结束或失败后都会清理临时帧目录，已生成的截图和三帧保留。
+`--evidence` 默认依次截每个状态的 1 倍图，两个以上状态时再出并排图和遮字并排图，再截第一个状态的 2 倍图。明确写了 `--zoom` 时，改为每个状态各截指定倍数，并排图也各出一套；例如 `--evidence --states idle,done --zoom 1,2`。随后探测动效、录首次进入的出场、录每组动作。首次出场先回空白页，用 `record-entry.mp4` 和 `motion-entry-start/mid/end.jpg`；动作组名为 entry 时出场改用 entry-appearance，名字仍冲突时继续加 -appearance。所有结果进同一个目录和 report.json。一项执行失败会写进汇总，继续其他项，返回码为 1。每组录屏结束或失败后都会清理临时帧目录，已生成的截图和三帧保留。
 
 结果写进 `--out` 指定的目录，默认是 `./shots`：每个状态一张 `<状态>.png`，遮字版是 `<状态>-masked.png`，标注版是 `<状态>-marked.png`，并排图是 `sheet.png` 和 `sheet-masked.png`，单个无名动作组的录屏仍是 `record.mp4` 和 `motion-start/mid/end.jpg`；具名或多组用 `record-<组名>.mp4` 和 `motion-<组名>-start/mid/end.jpg`，截图也带组名。多个倍数各出一套，2 倍文件名加 `-@2x`。每张图都会检查控制台错误、横向溢出和没加载出来的图片，命令最后一行给出结论，明细在 `report.json`。录屏需要本机装了 ffmpeg，没有时只留三帧。
+
+`@2x` 是同一个视口用 2 倍像素密度截的图，页面布局不变，不是把页面放大到 200% 后的重排。
+
+`report.json` 的最外层是数组，每个元素是一张图或一项检查的结果；`lint`、`motion`、`issues` 在各个元素里。结构示意：
+
+```json
+[{"file":"idle.png","lint":[],"issues":[]},
+ {"file":"motion-probe","motion":{},"issues":[]}]
+```
+
+动作录屏的开始帧取最后一个 click、dblclick、drag、type、fill、select 或 key 派发前，中间帧取该动作反馈中段，结束帧取 hold 结束时；等待、悬停和滚动不改变取样动作。纯出场三帧按第一次出现内容到稳定来取，有限动画最多额外等 2 秒，不等无限循环；没有动作的普通录屏仍取整段的头、中、尾。各帧的文件名和相对录屏起点的毫秒数在 `frames.start/mid/end` 的 `file`、`timeMs` 里，录屏时长在 `durationMs` 里。动效本身不足 3 秒时，录屏短于 3 秒是正常的，三帧能说明问题就够。
 
 截图在 `--wait` 之后再等有限时长的动画和过渡结束，每张截图额外最多等 2 秒，不等无限循环；有动作时，操作前后共用这 2 秒。实际等待毫秒数写进 `report.json` 的 `animationWaitMs`。录屏和动效探测保持原来的时机。
 
