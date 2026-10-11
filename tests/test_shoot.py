@@ -39,6 +39,52 @@ def find_browser():
 
 @unittest.skipUnless(NODE, "Node is not installed")
 class ShootCLITests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed to inspect encoded frames')
+    def test_encoder_keeps_short_feedback_at_its_original_time(self):
+        with tempfile.TemporaryDirectory(prefix='oil-shoot-encoding-') as temp:
+            folder = Path(temp)
+            for name, color in [('red', (255, 0, 0)), ('blue', (0, 0, 255)), ('green', (0, 255, 0))]:
+                ppm = b'P6\n64 64\n255\n' + bytes(color) * (64 * 64)
+                subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'image2pipe', '-i', '-',
+                                '-frames:v', '1', str(folder / (name + '.jpg'))],
+                               input=ppm, check=True, capture_output=True, timeout=10)
+            # Exercise the production concat writer without timing a real browser animation.
+            javascript = '''import {readFileSync} from 'node:fs'; import {basename} from 'node:path';
+const source=readFileSync(process.argv[1],'utf8');
+const writer=source.slice(source.indexOf('function screencastList('),source.indexOf('async function record('));
+const frames=JSON.parse(process.argv[2]);const finished=Number(process.argv[3]);
+process.stdout.write(eval(writer+'; screencastList(frames,finished)'));'''
+            frames = [{'name': name + '.jpg', 't': t} for name, t in
+                      [('red', 0), ('blue', .949), ('green', .965), ('blue', 2.13)]]
+            result = subprocess.run([NODE, '--input-type=module', '-e', javascript, str(SCRIPT), json.dumps(frames), '2.146'],
+                                    check=True, capture_output=True, text=True, timeout=10)
+            (folder / 'list.txt').write_text(result.stdout)
+            video = folder / 'record.mp4'
+            subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i',
+                            str(folder / 'list.txt'), '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30',
+                            '-pix_fmt', 'yuv420p', str(video)], check=True, capture_output=True, timeout=10)
+            decoded = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(video), '-vf',
+                                      'format=rgb24,crop=1:1:32:32', '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-'],
+                                     check=True, capture_output=True, timeout=10).stdout
+            # The 949ms blue feedback overlaps the 30fps sample at frame 28; default JPEG
+            # time-base rounding used to erase it while the separately saved JPEG survived.
+            red, green, blue = decoded[28 * 3:29 * 3]
+            self.assertLess(red, 50)
+            self.assertLess(green, 50)
+            self.assertGreater(blue, 180)
+            # The end screenshot must also survive an ending halfway between output ticks.
+            tail_frames = [{'name': 'red.jpg', 't': 0}, {'name': 'blue.jpg', 't': .950}]
+            result = subprocess.run([NODE, '--input-type=module', '-e', javascript, str(SCRIPT),
+                                     json.dumps(tail_frames), '.950'], check=True, capture_output=True, text=True, timeout=10)
+            (folder / 'list.txt').write_text(result.stdout)
+            subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i',
+                            str(folder / 'list.txt'), '-vf', 'fps=30', '-pix_fmt', 'yuv420p', str(video)],
+                           check=True, capture_output=True, timeout=10)
+            decoded = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(video), '-vf',
+                                      'format=rgb24,crop=1:1:32:32', '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-'],
+                                     check=True, capture_output=True, timeout=10).stdout
+            self.assertGreater(decoded[-1], 180, 'The appended screenshot must be the encoded last frame')
+
     def test_help(self):
         result = subprocess.run([NODE, str(SCRIPT), "--help"], cwd=ROOT,
                                 capture_output=True, text=True, timeout=10)
@@ -51,19 +97,35 @@ class ShootCLITests(unittest.TestCase):
         self.assertIn("中心点遮挡和禁用状态", result.stdout)
         self.assertIn("显式 --zoom 按倍数截每个状态", result.stdout)
 
-    def test_evidence_documentation_and_report_structure_example(self):
-        documentation = (ROOT / 'references/tools.md').read_text(encoding='utf-8')
+    def test_help_carries_the_reference_and_report_structure_example(self):
+        """参考内容放在 --help 里；references/tools.md 只讲什么时候用，并指到这里。"""
+        documentation = subprocess.run([NODE, str(SCRIPT), "--help"], cwd=ROOT,
+                                       capture_output=True, text=True, timeout=10).stdout
         self.assertIn('最外层是数组', documentation)
         self.assertIn('不是把页面放大到 200% 后的重排', documentation)
         self.assertIn('录屏短于 3 秒是正常的', documentation)
         self.assertIn('frames.start/mid/end', documentation)
-        example = documentation.split('结构示意：', 1)[1].split('```json\n', 1)[1].split('```', 1)[0].strip()
-        self.assertEqual(len(example.splitlines()), 2)
-        report = json.loads(example)
+        lines = documentation.split('结构示意：', 1)[1].strip().splitlines()[:2]
+        report = json.loads(''.join(line.strip() for line in lines))
         self.assertIsInstance(report, list)
         self.assertIn('lint', report[0])
         self.assertIn('motion', report[1])
         self.assertTrue(all('issues' in entry for entry in report))
+        guide = (ROOT / 'references/tools.md').read_text(encoding='utf-8')
+        self.assertIn('--help', guide)
+        self.assertLess(len(guide), 3500, 'tools.md 只留什么时候用和最常用的命令，参考内容写进 --help')
+
+    def test_timeout_scale_validation_and_help(self):
+        plan = self.dry('--timeout-scale', '2')
+        self.assertEqual(plan['options']['timeout-scale'], '2')
+        for value in ('0', '-1', '0.5', 'NaN', 'Infinity', 'slow'):
+            with self.subTest(value=value):
+                message = self.dry('--timeout-scale', value, ok=False)
+                self.assertIn('收到 ' + value, message)
+                self.assertIn('--timeout-scale 2', message)
+        result = subprocess.run([NODE, str(SCRIPT), '--help'], capture_output=True, text=True, timeout=10)
+        self.assertIn('90 秒', result.stdout)
+        self.assertIn('--timeout-scale', result.stdout)
 
     def test_missing_target(self):
         result = subprocess.run([NODE, str(SCRIPT)], cwd=ROOT,
@@ -87,7 +149,7 @@ class ShootCLITests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
 
     def test_missing_option_value(self):
-        for option in ("--out", "--size", "--states", "--param", "--zoom", "--steps", "--hold", "--wait", "--compare"):
+        for option in ("--out", "--size", "--states", "--param", "--zoom", "--steps", "--hold", "--wait", "--compare", "--timeout-scale"):
             for following in ((), ("--force",)):
                 with self.subTest(option=option, following=following):
                     result = subprocess.run([NODE, str(SCRIPT), option, *following], cwd=ROOT,
@@ -632,6 +694,51 @@ h1{font-size:48px;margin:0 0 24px;background:linear-gradient(90deg,#7c3aed,#06b6
             self.assertIn(rule, rules)
         self.assertIn("默认做法提示", result.stdout)
 
+    def test_lint_spares_reactions_but_keeps_navigation_and_feature_emoji(self):
+        self.page.write_text('''<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,">
+<button aria-pressed="false"><span>😍</span><span>5</span></button>
+<button><span>🔥</span> 3</button><button role="button" aria-pressed="true"><span>😂</span></button>
+<p>用户内容 <span>🚀</span></p><blockquote><span>💰</span></blockquote>
+<div role="listbox"><button>🧡</button><button>☀️</button></div>
+<nav><button aria-pressed="true"><span>🚀</span> 启动</button><a><span>💰</span> 账户</a></nav>
+<ul><li><span>🧭</span> 方向</li><li><span>🎉</span> 成果</li></ul>''', encoding='utf-8')
+        output = self.folder / 'semantic-emoji'
+        self.shoot(output)
+        hints = json.loads((output / 'report.json').read_text())[0]['lint']
+        emoji = next(h for h in hints if h['rule'] == 'emojiIcon')
+        self.assertEqual(emoji['count'], 4)
+        self.assertFalse(any(symbol in ' '.join(emoji['examples']) for symbol in ('😍', '🔥', '😂', '🧡', '☀️')))
+
+    def test_lint_spares_interaction_boundaries_attachments_and_empty_slots(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+body{margin:0}.outer{border-radius:12px;background:#eee;padding:12px;width:340px}
+.box{border:1px solid #777;border-radius:8px;padding:8px;width:260px;min-height:56px;background:white}
+.popup{position:absolute;top:0;left:420px}.fixed{position:fixed;top:90px;left:420px}
+</style><form class="outer"><textarea></textarea>
+<div class="box"><strong>draft.svg</strong><small>SVG · 1 KB</small><button>移除</button></div>
+<div class="box"><strong>draft.svg</strong><small>正在读取</small><button>重试</button></div>
+<div class="box popup">候选 <div class="box">选项</div></div>
+<div class="box fixed">候选</div></form>
+<div class="outer"><div class="box" role="listbox">候选</div><div class="box" role="menu">菜单</div>
+<div class="box" role="dialog">对话</div><div class="box" role="tooltip">说明</div>
+<div class="box" popover="manual" id="popover">弹层</div><div class="box"></div></div>
+<script>popover.showPopover()</script>''', encoding='utf-8')
+        output = self.folder / 'semantic-cards'
+        self.shoot(output, '--size', 'desktop')
+        hints = json.loads((output / 'report.json').read_text())[0]['lint']
+        self.assertNotIn('nestedCards', {h['rule'] for h in hints})
+
+    def test_lint_keeps_content_cards_inside_panels_and_editors(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+.outer{border-radius:12px;background:#eee;padding:12px;width:340px}
+.box{border:1px solid #777;border-radius:8px;padding:8px;width:260px;min-height:56px}
+</style><div class="outer" style="position:relative;height:100px"><div class="box" style="position:absolute;left:12px;top:12px">真正的内容卡片</div></div>
+<form class="outer"><textarea></textarea><div class="box"><h3>另一个内容面板</h3><p>说明</p><button>操作</button></div></form>''', encoding='utf-8')
+        output = self.folder / 'real-cards'
+        self.shoot(output, '--size', 'desktop')
+        hints = json.loads((output / 'report.json').read_text())[0]['lint']
+        self.assertEqual(next(h for h in hints if h['rule'] == 'nestedCards')['count'], 2)
+
     def test_lint_requires_body_contrast_of_4_5(self):
         self.page.write_text('''<!doctype html><html><head><link rel="icon" href="data:,"><style>
 body{margin:0;padding:40px;font:16px/1.6 sans-serif;color:#222;background:#fff}
@@ -1121,6 +1228,134 @@ if(clicked!==1 || !hovered || !doubled || !dragged || document.querySelectorAll(
         self.assertEqual(list(failed.glob('frames*')), [])
         self.assert_artifacts(failed, ('motion-good-end.jpg', 'motion-entry-end.jpg', 'report.json'))
         self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+
+    def fault_env(self, drops='', stale=None):
+        # Keep a real Chrome/CDP transport. Only selected responses are suppressed; accelerate
+        # those watchdogs after recording the production timeout value, leaving all other timers intact.
+        preload = self.folder / 'fault.mjs'
+        journal = self.folder / 'fault.jsonl'
+        preload.write_text('''import {appendFileSync,readFileSync} from 'node:fs';
+const originalTimer=globalThis.setTimeout;let watchdog;
+globalThis.setTimeout=(callback,delay,...args)=>{const timer=originalTimer(callback,delay,...args);if(delay>=90000)watchdog={callback,delay,timer};return timer};
+const Native=globalThis.WebSocket;let captures=0,connections=0;
+const drops=new Set((process.env.SHOOT_TEST_DROPS||'').split(',').map(Number));
+const write=row=>appendFileSync(process.env.SHOOT_TEST_JOURNAL,JSON.stringify(row)+'\\n');
+globalThis.WebSocket=class extends Native {
+ constructor(...args){super(...args);write({connection:++connections});
+   const substituted=new WeakSet();
+   this.addEventListener('message',event=>{
+    if(substituted.has(event)||!process.env.SHOOT_TEST_STALE)return;
+    const msg=JSON.parse(event.data);
+    if(msg.method!=='Page.screencastFrame')return;
+    event.stopImmediatePropagation();msg.params.data=readFileSync(process.env.SHOOT_TEST_STALE).toString('base64');
+    const replacement=new MessageEvent('message',{data:JSON.stringify(msg)});substituted.add(replacement);this.dispatchEvent(replacement);
+   });
+ }
+ send(data){const msg=JSON.parse(data);if(msg.method==='Page.captureScreenshot'){
+   write({capture:++captures,timeout:watchdog.delay});
+   if(drops.has(captures)){clearTimeout(watchdog.timer);originalTimer(watchdog.callback,100);return;}
+ }return super.send(data)}
+};''')
+        return dict(self.env, NODE_OPTIONS='--import=' + str(preload), SHOOT_TEST_DROPS=drops,
+                    SHOOT_TEST_JOURNAL=str(journal), **({'SHOOT_TEST_STALE': str(stale)} if stale else {})), journal
+
+    def test_screenshot_timeout_reopens_and_retries_once(self):
+        env, journal = self.fault_env('1')
+        output = self.folder / 'screenshot-retry'
+        result = subprocess.run([NODE, str(SCRIPT), str(self.page), '--out', str(output), '--timeout-scale', '2'],
+                                cwd=ROOT, env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = [json.loads(line) for line in journal.read_text().splitlines()]
+        self.assertEqual(sum('connection' in row for row in events), 2)
+        self.assertEqual([row['timeout'] for row in events if 'capture' in row], [180000, 180000])
+        self.assertIn('正在重开浏览器重试 page.png 一次', result.stderr)
+        self.assertEqual(len(json.loads((output / 'report.json').read_text())), 1)
+        self.assert_artifacts(output, ('page.png', 'report.json'))
+        self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+
+    def test_masked_screenshot_timeout_replays_state_and_finishes_batch(self):
+        env, journal = self.fault_env('2')
+        output = self.folder / 'masked-retry'
+        result = subprocess.run([NODE, str(SCRIPT), str(self.page), '--out', str(output), '--states', 'a,b', '--mask'],
+                                cwd=ROOT, env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('[4/4]', result.stderr)
+        self.assertIn('--mask', result.stderr)
+        report = json.loads((output / 'report.json').read_text())
+        self.assertEqual([entry['file'] for entry in report], ['a.png', 'b.png'])
+        self.assertEqual([entry['issues'] for entry in report], [[], []])
+        self.assert_artifacts(output, ('a.png', 'a-masked.png', 'b.png', 'b-masked.png'))
+        self.assertNotEqual((output / 'a.png').read_bytes(), (output / 'a-masked.png').read_bytes())
+        self.assertNotEqual((output / 'a-masked.png').read_bytes(), (output / 'b-masked.png').read_bytes())
+        events = [json.loads(line) for line in journal.read_text().splitlines()]
+        self.assertEqual(sum('connection' in row for row in events), 2)
+        self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed for evidence')
+    def test_second_screenshot_timeout_marks_item_failed_and_continues_evidence(self):
+        env, journal = self.fault_env('1,2')
+        output = self.folder / 'screenshot-failed-evidence'
+        result = subprocess.run([NODE, str(SCRIPT), str(self.page), '--out', str(output), '--evidence',
+                                 '--hold', '100', '--steps', 'toggle: click #go'],
+                                cwd=ROOT, env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads((output / 'report.json').read_text())
+        self.assertTrue(report[0]['failed'])
+        self.assertIn('Page.captureScreenshot 90 秒', report[0]['issues'][-1])
+        self.assertFalse(any(row['file'] == 'browser' for row in report))
+        self.assertTrue(any(row['file'] == 'motion-probe-toggle' for row in report))
+        self.assert_artifacts(output, ('page-@2x.png', 'record-entry.mp4', 'record-toggle.mp4', 'report.json'))
+        self.assertIn('[5/5]', result.stderr)
+        self.assertNotRegex(result.stdout, r'\[\d+/\d+\]')
+        self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+
+    def test_screenshot_retry_cannot_reopen_browser_aborts(self):
+        if sys.platform == 'win32':
+            self.skipTest('POSIX browser wrapper')
+        import shlex
+        env, _ = self.fault_env('1')
+        wrapper = self.folder / 'cannot-reopen'
+        marker = self.folder / 'launched'
+        wrapper.write_text('#!/bin/sh\nif [ -f ' + shlex.quote(str(marker)) + ' ]; then exit 1; fi\n'
+                           'touch ' + shlex.quote(str(marker)) + '\nexec ' + shlex.quote(self.browser) + ' "$@"\n')
+        wrapper.chmod(0o755)
+        output = self.folder / 'restart-failed'
+        result = subprocess.run([NODE, str(SCRIPT), str(self.page), '--out', str(output), '--evidence'],
+                                cwd=ROOT, env=dict(env, CHROME_PATH=str(wrapper)), capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('浏览器重开失败', result.stderr)
+        report = json.loads((output / 'report.json').read_text())
+        self.assertEqual(report[-1]['file'], 'browser')
+        self.assertEqual(list(output.glob('record*.mp4')), [])
+        self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed to inspect recording')
+    def test_stale_screencast_warns_preserves_stream_and_appends_screenshot(self):
+        self.page.write_text('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><style>body{margin:0;background:#182838}'
+                             '#box{position:absolute;left:60px;top:40px;width:240px;height:160px;border:4px solid #ffff00}</style><div id="box"></div>')
+        stale = self.folder / 'stale.jpg'
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+                        'color=c=0x182838:s=390x844,drawbox=x=60:y=40:w=248:h=168:color=yellow:t=4,'
+                        'drawbox=x=304:y=44:w=4:h=160:color=0x182838:t=fill',
+                        '-frames:v', '1', str(stale)], check=True, capture_output=True, timeout=10)
+        env, _ = self.fault_env(stale=stale)
+        output = self.folder / 'stale-stream'
+        result = subprocess.run([NODE, str(SCRIPT), str(self.page), '--out', str(output), '--record', '--hold', '100'],
+                                cwd=ROOT, env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        entry = json.loads((output / 'report.json').read_text())[0]
+        self.assertEqual(entry['consistency']['status'], 'mismatch')
+        self.assertIn('可能没拍全', entry['warnings'][0])
+        self.assertIn('静止终态以 motion-end.jpg 为准', result.stdout)
+        self.assertEqual((output / 'record-stream-end.jpg').read_bytes(), stale.read_bytes())
+        self.assertLess(entry['consistency']['pixelRatio'], .005, 'A thin missing border must survive whole-viewport dilution')
+        self.assertGreater(self.frame_pixel(output / 'motion-end.jpg', 306, 80)[1], 220)
+        last = subprocess.run(['ffmpeg', '-v', 'error', '-sseof', '-0.04', '-i', str(output / 'record.mp4'),
+                               '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-vf', 'format=rgb24,crop=1:1:306:80', '-'],
+                              capture_output=True, timeout=10)
+        self.assertEqual(last.returncode, 0, last.stderr)
+        self.assertGreater(last.stdout[1], 220)
+        self.assertEqual(list(output.glob('frames*')), [])
 
     def test_cdp_request_times_out_in_current_step(self):
         import time

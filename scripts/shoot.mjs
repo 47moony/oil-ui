@@ -34,6 +34,7 @@ const HELP = `常用命令：
                         首次出场录屏和每组动作录屏；显式 --zoom 按倍数截每个状态；一项失败仍继续
   --compare <参考图>    截图与 png/jpg/webp 参考图出四格对比和九宫格差异报告
   --wait <毫秒>         页面加载后等待时间，默认 400；截图另等有限动画，最多 2 秒
+  --timeout-scale <倍数> 整体放宽协议、启动和编码超时，例如 --timeout-scale 2；默认 1
   --dry-run             只检查选项和动作写法，输出解析 JSON，不启动浏览器
 
 动作写法（用分号分隔；引号、方括号、圆括号里的分号不拆）：
@@ -58,9 +59,44 @@ const HELP = `常用命令：
 选项都可写成 --名字=值 或 --名字 值；开关不带值。重复状态、尺寸和倍数会去重；文件名冲突会自动加编号。
 元素匹配多个时取第一个可见的；匹配到但隐藏时说明原因，并给可见元素的写法。
 点击、双击和悬停前检查中心点遮挡和禁用状态；提示写进输出和 report.json 的问题汇总，动作照常执行，返回码不变。
-CDP 单个请求超过 30 秒或浏览器意外断开时，报出当前步骤并退出。
+截图单次最多等 90 秒，超时后重开浏览器重试这一项一次；仍失败则继续后面的项，返回码 1。
+其他 CDP 请求默认等 30 秒；超时或浏览器意外断开时退出，可用 --timeout-scale 2 放宽。
+多项命令每完成一项向标准错误打印进度，标准输出仍是最后的汇总。
 每张图检查控制台错误、横向溢出和加载失败的图片，明细写进 report.json；
-默认做法和可读性提示写进 lint 字段。录屏需要 ffmpeg，没有时只留帧。`;
+默认做法和可读性提示写进 lint 字段。录屏需要 ffmpeg，没有时只留帧。
+
+和 --states 一起用：
+  普通截图会在每个状态执行每组 --steps；动效探测和动作录屏只从第一个状态、第一种尺寸开始，
+  --evidence 每组各录一次，不会给每个状态各录一遍。
+  --evidence 默认只有第一个状态出 2 倍图；每个状态都要时写 --zoom 1,2 或 --zoom 2，
+  文件会多出将近一倍，只在各状态都要放大查细节或交付高分辨率图时这样做。
+
+输出文件（写进 --out）：
+  <状态>.png，遮字版 <状态>-masked.png，标注版 <状态>-marked.png，并排图 sheet.png 和 sheet-masked.png，
+  还原比对 <状态>-compare.png（四格依次是参考、当前、叠加和差异热图）。多个倍数各出一套，2 倍的文件名带 @2x。
+  @2x 是同一个视口用 2 倍像素密度截的图，页面布局不变，不是把页面放大到 200% 后的重排。
+  录屏：单个无名组是 record.mp4 和 motion-start/mid/end.jpg；具名或多组是 record-<组名>.mp4
+  和 motion-<组名>-start/mid/end.jpg；首次出场是 record-entry.mp4 和 motion-entry-start/mid/end.jpg。
+  report.json 的最外层是数组，每个元素是一张图或一项检查的结果；lint、motion、issues 在各个元素里。结构示意：
+  [{"file":"idle.png","lint":[],"issues":[]},
+   {"file":"motion-probe","motion":{},"issues":[]}]
+
+录屏怎样取样：
+  动作录屏的开始帧取最后一个 click、dblclick、drag、type、fill、select 或 key 派发前，
+  中间帧取这个动作反馈的中段，结束帧取 hold 结束时；等待、悬停和滚动不改变取样动作。
+  出场三帧从第一次出现内容取到稳定；没有动作的普通录屏取整段的头、中、尾。
+  各帧的文件名和时间在 report.json 的 frames.start/mid/end 里，录屏时长在 durationMs 里。
+  动效本身不足 3 秒时，录屏短于 3 秒是正常的。
+  录屏的最后一帧和结束时新截的图差得明显时，汇总和 report.json 的 warnings 里会有警告，
+  并用结束截图补上录像的最后一帧；这时静止终态以 motion-<组名>-end.jpg 为准，过渡过程不能据此判通过。
+
+其他：
+  --compare 先用 --size 设成参考图的逻辑尺寸，例如 2880 宽的 2 倍图用 1440 宽；
+  差异占比只用来找先修哪一块、看修改有没有让差异变少，不是还原度的分数。
+  --motion 只说明动了没有、动了多少：首次进入没有动画、动作没有反馈、从头滚到底没有变化会记为问题；
+  页面不能滚动时跳过滚动检查；Canvas 和 WebGL 里的动画可能探测不到，以录屏为准。
+  本地文件会用只监听本机的临时服务器打开；地址里带 ? 或 & 时加引号，或改用 --query。
+  WebGL 页面在没有显卡的机器上改用软件渲染；画布没能创建绘图上下文时会记为问题，这时截图是空的。`;
 
 function fail(message) { console.error(`shoot：${message}`); process.exit(1); }
 function distance(a, b) {
@@ -223,11 +259,18 @@ try {
   sizes = deduplicate(sizes, (s) => `${s.w}x${s.h}`, "尺寸");
   zooms = deduplicate(zooms, String, "倍数");
   for (const key of ["hold", "wait"]) if (!/^\d+(?:\.\d+)?$/.test(opt[key])) throw new Error(`--${key} 需要毫秒数，收到 ${opt[key]}；例如 --${key} 1000`);
+  if (opt["timeout-scale"] !== undefined && (!Number.isFinite(Number(opt["timeout-scale"])) || Number(opt["timeout-scale"]) < 1)) throw new Error(`超时倍数不对，收到 ${opt["timeout-scale"]}；例如 --timeout-scale 2`);
   marks = (opt.mark ? splitOutside(opt.mark) : []).map((s, i) => {
     const m = s.match(/^(\d+)\s*=\s*(.+)$/);
     return { label: m ? m[1] : String(i + 1), selector: parseSelector(m ? m[2] : s) };
   });
 } catch (error) { fail(error.message); }
+const timeoutScale = Number(opt["timeout-scale"] || 1);
+const timeoutMs = (ms) => Math.min(2147483647, ms * timeoutScale);
+const quoteArg = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
+const retryCommand = `node ${quoteArg(resolve(process.argv[1]))} ${quoteArg(target)} --timeout-scale 2`;
+let currentRetryCommand = retryCommand;
+const slowHint = () => `同时开了很多个任务时会变慢；可先单独重跑：${currentRetryCommand}`;
 const states = deduplicate(opt.states ? opt.states.split(",").map((s) => s.trim()).filter(Boolean) : [null], String, "状态");
 if (!states.length) fail(`--states 没有状态，收到 ${opt.states}；例如 --states idle,done`);
 const stateIds = states.map((s, i) => !s ? "page" : /^[A-Za-z0-9_-]{1,80}$/.test(s) ? s : `state-${i + 1}-${createHash("sha256").update(s).digest("hex").slice(0, 12)}`);
@@ -341,7 +384,7 @@ async function launchChrome() {
     "--no-default-browser-check", "--hide-scrollbars", "--mute-audio", "--disable-extensions", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
   return new Promise((ok, no) => {
     let buf = "";
-    const timer = setTimeout(() => finish(new Error("timeout")), 45000);
+    const timer = setTimeout(() => finish(new Error("timeout")), timeoutMs(45000));
     const onData = (d) => { buf += d; const m = buf.match(/DevTools listening on (ws:\/\/\S+)/); if (m) finish(null, m[1]); };
     const onError = (e) => finish(e);
     const onExit = () => finish(new Error("浏览器提前退出"));
@@ -357,8 +400,8 @@ for (let attempt = 0; attempt < 2; attempt++) {
   try { wsUrl = await launchChrome(); break; }
   catch (error) {
     await stopChrome();
-    if (attempt || error.message !== "timeout") fail(`浏览器启动失败：${error.message === "timeout" ? "45 秒内没有启动，重试一次仍失败" : error.message}；同时开了很多个任务时会变慢。`);
-    console.error("shoot：浏览器 45 秒内没有启动，正在重试一次；同时开了很多个任务时会变慢。");
+    if (attempt || error.message !== "timeout") fail(`浏览器启动失败：${error.message === "timeout" ? `${45 * timeoutScale} 秒内没有启动，重试一次仍失败` : error.message}；${slowHint()}`);
+    console.error(`shoot：浏览器 ${45 * timeoutScale} 秒内没有启动，正在重试一次；${slowHint()}`);
   }
 }
 
@@ -368,7 +411,7 @@ async function during(context, work) {
   const previous = currentContext; currentContext = context;
   try { return await work(); } finally { currentContext = previous; }
 }
-const ws = new WebSocket(wsUrl);
+let ws, sessionId, browserNeedsRestart = false;
 let seq = 0;
 const pending = new Map(), listeners = [];
 let saveFatalReport = () => {};
@@ -381,57 +424,82 @@ function abortTransport(error) {
   try { saveFatalReport(error); } catch {}
   void cleanup().finally(() => process.exit(1));
 }
-ws.onclose = () => abortTransport(new Error(`${currentContext}：浏览器连接意外断开，已停止执行。`));
-ws.onerror = () => abortTransport(new Error(`${currentContext}：浏览器连接出错，已停止执行。`));
-try {
+async function connectTransport(url) {
+  ws = new WebSocket(url);
+  ws.onclose = () => abortTransport(new Error(`${currentContext}：浏览器连接意外断开，已停止执行；${slowHint()}`));
+  ws.onerror = () => abortTransport(new Error(`${currentContext}：浏览器连接出错，已停止执行；${slowHint()}`));
   await new Promise((ok, no) => {
-    const timer = setTimeout(() => { const error = new Error("连接浏览器：30 秒内没有响应，已停止执行。"); no(error); abortTransport(error); }, 30000);
+    const timer = setTimeout(() => { const error = new Error(`连接浏览器：${30 * timeoutScale} 秒内没有响应；${slowHint()}`); no(error); abortTransport(error); }, timeoutMs(30000));
     ws.onopen = () => { clearTimeout(timer); ok(); };
     const failed = () => { clearTimeout(timer); no(transportFailure || new Error("连接浏览器失败")); };
     ws.addEventListener("close", failed, { once: true }); ws.addEventListener("error", failed, { once: true });
   });
-} catch { await cleanup(); process.exit(1); }
-ws.onmessage = (event) => {
-  const msg = JSON.parse(event.data);
-  if (msg.id && pending.has(msg.id)) {
-    const { ok, no, timer, context } = pending.get(msg.id);
-    pending.delete(msg.id); clearTimeout(timer);
-    msg.error ? no(new Error(`${context}：${msg.error.message}`)) : ok(msg.result);
-  } else if (msg.method) listeners.forEach((fn) => fn(msg));
-};
-const send = (method, params = {}, sessionId) => new Promise((ok, no) => {
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.id && pending.has(msg.id)) {
+      const { ok, no, timer, context } = pending.get(msg.id);
+      pending.delete(msg.id); clearTimeout(timer);
+      msg.error ? no(new Error(`${context}：${msg.error.message}`)) : ok(msg.result);
+    } else if (msg.method) listeners.forEach((fn) => fn(msg));
+  };
+}
+const send = (method, params = {}, targetSession) => new Promise((ok, no) => {
   if (transportFailure || ws.readyState !== WebSocket.OPEN) { no(transportFailure || new Error(`${currentContext}：浏览器连接已经断开。`)); return; }
   const id = ++seq, context = currentContext;
-  const timer = setTimeout(() => abortTransport(new Error(`${context}：CDP ${method} 30 秒内没有响应，已停止执行。`)), 30000);
+  // Rasterization competes with other tasks for CPU/GPU time; allow three ordinary request budgets.
+  const limit = timeoutMs(method === "Page.captureScreenshot" ? 90000 : 30000);
+  const timer = setTimeout(() => {
+    const error = new Error(`${context}：CDP ${method} ${limit / 1000} 秒内没有响应；${slowHint()}`);
+    if (method === "Page.captureScreenshot") {
+      pending.delete(id); browserNeedsRestart = true; error.code = "SCREENSHOT_TIMEOUT"; no(error);
+    } else abortTransport(error);
+  }, limit);
   pending.set(id, { ok, no, timer, context });
-  try { ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); }
-  catch { abortTransport(new Error(`${context}：发送 CDP ${method} 时浏览器连接断开，已停止执行。`)); }
+  try { ws.send(JSON.stringify({ id, method, params, ...(targetSession ? { sessionId: targetSession } : {}) })); }
+  catch { abortTransport(new Error(`${context}：发送 CDP ${method} 时浏览器连接断开，已停止执行；${slowHint()}`)); }
 });
+try { await connectTransport(wsUrl); } catch { await cleanup(); process.exit(1); }
 
 async function setupSend(...args) {
   try { return await send(...args); }
   catch (error) { if (transportFailure) { await cleanup(); process.exit(1); } throw error; }
 }
-const { targetId } = await setupSend("Target.createTarget", { url: "about:blank" });
-const { sessionId } = await setupSend("Target.attachToTarget", { targetId, flatten: true });
 const cdp = (method, params) => setupSend(method, params, sessionId);
-await cdp("Page.enable");
-await cdp("Runtime.enable");
-await cdp("Log.enable");
-// 记下创建失败或丢失的 WebGL 上下文：截图照样成功，画布却是空的。
-// 先试 webgl2、失败后退回 webgl 的页面不算失败，只看最后有没有拿到。
-await cdp("Page.addScriptToEvaluateOnNewDocument", { source: `(() => {
-  const gl = window.__oilWebgl = { failed: [], ok: [], lost: 0 };
-  const get = HTMLCanvasElement.prototype.getContext;
-  HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
-    const ctx = get.call(this, type, ...rest);
-    if (/^(webgl2?|experimental-webgl)$/.test(type)) {
-      if (!ctx) gl.failed.push(this);
-      else if (!gl.ok.includes(this)) { gl.ok.push(this); this.addEventListener("webglcontextlost", () => gl.lost++); }
-    }
-    return ctx;
-  };
-})()` });
+async function setupSession() {
+  const { targetId } = await setupSend("Target.createTarget", { url: "about:blank" });
+  ({ sessionId } = await setupSend("Target.attachToTarget", { targetId, flatten: true }));
+  await cdp("Page.enable");
+  await cdp("Runtime.enable");
+  await cdp("Log.enable");
+  // 记下创建失败或丢失的 WebGL 上下文：截图照样成功，画布却是空的。
+  // 先试 webgl2、失败后退回 webgl 的页面不算失败，只看最后有没有拿到。
+  await cdp("Page.addScriptToEvaluateOnNewDocument", { source: `(() => {
+    const gl = window.__oilWebgl = { failed: [], ok: [], lost: 0 };
+    const get = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
+      const ctx = get.call(this, type, ...rest);
+      if (/^(webgl2?|experimental-webgl)$/.test(type)) {
+        if (!ctx) gl.failed.push(this);
+        else if (!gl.ok.includes(this)) { gl.ok.push(this); this.addEventListener("webglcontextlost", () => gl.lost++); }
+      }
+      return ctx;
+    };
+  })()` });
+}
+await setupSession();
+async function restartBrowser() {
+  ws.onclose = ws.onerror = ws.onmessage = null; ws.close();
+  for (const request of pending.values()) { clearTimeout(request.timer); request.no(new Error("截图超时，正在重开浏览器")); }
+  pending.clear();
+  await stopChrome();
+  try {
+    await connectTransport(await launchChrome());
+    await setupSession(); browserNeedsRestart = false;
+  } catch (error) {
+    abortTransport(new Error(`浏览器重开失败，收到 ${error.message}；${slowHint()}`));
+    throw error;
+  }
+}
 
 let problems = [];
 function isAutoFavicon(url) {
@@ -463,7 +531,7 @@ async function open(url, wait = Number(opt.wait)) {
     const loaded = new Promise((ok) => {
       loadedListener = (m) => { if (m.sessionId === sessionId && m.method === "Page.loadEventFired") ok(); };
       listeners.push(loadedListener);
-      timer = setTimeout(ok, 15000);
+      timer = setTimeout(ok, timeoutMs(15000));
     });
     try {
       const nav = await cdp("Page.navigate", { url });
@@ -641,8 +709,19 @@ function lintPage() {
   }
 
   // 卡片里套卡片：有边框或阴影的圆角块，放在另一个圆角块里
+  const boundary = (el) => {
+    if (el.matches('[role="listbox"],[role="menu"],[role="dialog"],[role="tooltip"],[popover]')) return true;
+    const position = css(el).position;
+    if (position === "fixed") return true;
+    if (position !== "absolute" || !el.parentElement) return false;
+    const r = el.getBoundingClientRect(), parent = el.parentElement.getBoundingClientRect();
+    // A positioned card inside a panel is still a card; a popup crosses its DOM parent's boundary.
+    return r.left < parent.left - 1 || r.top < parent.top - 1 || r.right > parent.right + 1 || r.bottom > parent.bottom + 1;
+  };
+  const content = (el) => (el.textContent || "").trim() || el.querySelector("img,svg,canvas,video,input,select,textarea,button,a,[contenteditable]");
   const card = (el, inner) => {
     const s = css(el), r = el.getBoundingClientRect();
+    if (boundary(el) || !content(el)) return false;
     if (r.width < 120 || r.height < 56 || /^(BUTTON|A|INPUT|SELECT|TEXTAREA|IMG|VIDEO|CANVAS|LABEL|SUMMARY|PRE|CODE)$/.test(el.tagName)) return false;
     if (parseFloat(s.borderTopLeftRadius) < 6) return false;
     const border = ["Top", "Right", "Bottom", "Left"].every((k) => parseFloat(s["border" + k + "Width"]) >= 1 && rgba(s["border" + k + "Color"]).a > 0.05);
@@ -651,15 +730,29 @@ function lintPage() {
     if (inner) return border || (shadow && fill);
     return (border || shadow || fill) && r.width * r.height < innerWidth * innerHeight * 0.6;
   };
+  const rCompact = (el) => el.getBoundingClientRect().height <= 100;
   for (const el of all) {
     if (!card(el, true)) continue;
     for (let up = el.parentElement, depth = 0; up && up !== document.body && depth < 8; up = up.parentElement, depth++) {
+      if (boundary(up)) break;
+      // A compact attachment with its own removal/retry control is editor content, not another panel.
+      const editor = up.matches("form,[role='textbox']") || up.querySelector("textarea,[contenteditable='true'],[contenteditable='']");
+      if (editor && rCompact(el) && el.querySelector("button,a,[role='button']") && !el.querySelector("h1,h2,h3,h4,section,article,textarea,[contenteditable]")) break;
       if (card(up, false)) { add("nestedCards", el, "外层 " + describe(up).split("「")[0]); break; }
     }
   }
 
   const emoji = /^(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}️)(?:‍\p{Extended_Pictographic}️?)*$/u;
-  const emojiHits = texts.filter((el) => emoji.test(ownText(el)) && !el.closest("p,blockquote,li > p"));
+  const reaction = (el) => {
+    const button = el.closest("button,[role='button']");
+    if (!button) return false;
+    const text = (button.textContent || "").trim();
+    const symbol = ownText(el);
+    // aria-pressed alone also describes toolbar toggles: require an emoji-only value or an adjacent count.
+    return (button.hasAttribute("aria-pressed") && text === symbol) ||
+      (text.startsWith(symbol) && /^\s*\d+(?:[.,]\d+)?\s*$/.test(text.slice(symbol.length)));
+  };
+  const emojiHits = texts.filter((el) => emoji.test(ownText(el)) && !el.closest("p,blockquote,li > p,[role='listbox'],[role='menu'],[popover]") && !reaction(el));
   if (emojiHits.length >= 2) emojiHits.forEach((el) => add("emojiIcon", el));
 
   if (chinese) {
@@ -952,7 +1045,7 @@ async function runSteps(steps = [], observer = {}) {
       await observer.step?.(step, i);
       if (action === "wait") { await sleep(params.ms); return; }
       if (action === "waitfor") {
-        const end = Date.now() + 5000;
+        const end = Date.now() + timeoutMs(5000);
         while (true) {
           try { await locate(selector, context, false, action, params); break; }
           catch (error) { if ((!error.message.includes("找不到元素") && !error.message.includes("都不可见")) || Date.now() >= end) throw error; await sleep(100); }
@@ -1106,7 +1199,7 @@ function runFfmpeg(args, timeout) {
       child.kill("SIGKILL");
       finish(null, { code: "ETIMEDOUT" });
       child.stderr.destroy();
-    }, timeout);
+    }, timeoutMs(timeout));
     child.stderr.on("data", (data) => { stderr = (stderr + data).slice(-16384); });
     child.once("error", (error) => finish(null, error));
     child.once("close", (code) => finish(code));
@@ -1137,6 +1230,35 @@ function recordTiming() {
   };
   tick();
 }
+async function frameDifference(first, second) {
+  return evaluate(`(async () => {
+    const load = (data) => new Promise((ok, no) => { const img = new Image(); img.onload = () => ok(img); img.onerror = () => no(new Error("录屏末帧无法解码")); img.src = "data:image/jpeg;base64," + data; });
+    const a = await load(${JSON.stringify(readFileSync(first).toString("base64"))});
+    const b = await load(${JSON.stringify(readFileSync(second).toString("base64"))});
+    if (a.width !== b.width || a.height !== b.height) return { different: true, dimensions: [a.width, a.height, b.width, b.height] };
+    const canvas = document.createElement("canvas"); canvas.width = a.width; canvas.height = a.height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(a, 0, 0); const p = ctx.getImageData(0, 0, a.width, a.height).data;
+    ctx.clearRect(0, 0, a.width, a.height); ctx.drawImage(b, 0, 0); const q = ctx.getImageData(0, 0, b.width, b.height).data;
+    const cols = Math.ceil(a.width / 32), tiles = new Uint32Array(cols * Math.ceil(a.height / 32));
+    let changed = 0;
+    for (let y = 0; y < a.height; y++) for (let x = 0; x < a.width; x++) {
+      const i = (y * a.width + x) * 4;
+      if ((Math.abs(p[i] - q[i]) + Math.abs(p[i + 1] - q[i + 1]) + Math.abs(p[i + 2] - q[i + 2])) / 3 > 32) {
+        changed++; tiles[Math.floor(y / 32) * cols + Math.floor(x / 32)]++;
+      }
+    }
+    const maxTile = tiles.reduce((n, v) => Math.max(n, v), 0);
+    return { different: changed >= 32 && (changed / (a.width * a.height) > .005 || maxTile >= 48), changedPixels: changed, maxTilePixels: maxTile, pixelRatio: changed / (a.width * a.height) };
+  })()`);
+}
+function screencastList(frames, finished) {
+  // JPEG's default 25fps time base rounds timestamps and can discard a short feedback frame.
+  // Use the same millisecond precision as the durations before resampling the video to 30fps.
+  const file = (frame) => `file '${basename(frame.name)}'\noption framerate 1000`;
+  // Keep a full 30fps output frame of the final still even when recording ends between ticks.
+  return frames.map((f, i) => `${file(f)}\nduration ${Math.max(i === frames.length - 1 ? 0.034 : 0.016, ((frames[i + 1]?.t ?? finished) - f.t)).toFixed(3)}`).join("\n") + `\n${file(frames.at(-1))}\n`;
+}
 async function record(url, w, h, { steps = [], name = "", entry = flags.has("entry"), zoom = zooms[0] } = {}) {
   const video = `record${name ? "-" + name : ""}.mp4`;
   const motion = `motion${name ? "-" + name : ""}`;
@@ -1147,14 +1269,14 @@ async function record(url, w, h, { steps = [], name = "", entry = flags.has("ent
   const lastAction = steps.findLastIndex((s) => ["click", "dblclick", "drag", "type", "fill", "select", "key"].includes(s.action));
   const captureFrame = async (label) => {
     const { data } = await cdp("Page.captureScreenshot", { format: "jpeg", quality: 88 });
-    const frame = { name: join(dir, `${label}.jpg`), t: Date.now() / 1000 };
+    const frame = { name: join(dir, `${label}.jpg`), t: Date.now() / 1000, source: "Page.captureScreenshot" };
     writeFileSync(frame.name, Buffer.from(data, "base64")); return frame;
   };
   const onFrame = (m) => {
     if (transportFailure || m.sessionId !== sessionId || m.method !== "Page.screencastFrame") return;
     const name = join(dir, `f${String(frames.length).padStart(4, "0")}.jpg`);
     writeFileSync(name, Buffer.from(m.params.data, "base64"));
-    frames.push({ name, t: Math.max(frames.at(-1)?.t || 0, m.params.metadata.timestamp) });
+    frames.push({ name, t: Math.max(frames.at(-1)?.t || 0, m.params.metadata.timestamp), source: "Page.screencastFrame" });
     cdp("Page.screencastFrameAck", { sessionId: m.params.sessionId }).catch(() => {});
   };
   try {
@@ -1188,8 +1310,28 @@ async function record(url, w, h, { steps = [], name = "", entry = flags.has("ent
     if (entry && lastAction < 0) await settleAnimations(2000);
     await sleep(Number(opt.hold));
     const finished = Date.now() / 1000;
-    const final = entry || lastAction >= 0 ? await captureFrame("hold-end") : null;
+    const final = await captureFrame("hold-end");
     if (final) final.t = finished;
+    const streamEnd = frames.filter((frame) => frame.t <= finished).at(-1);
+    const warnings = [];
+    let consistency = { status: "unavailable", reference: `${motion}-end.jpg` };
+    if (streamEnd) {
+      const difference = await frameDifference(streamEnd.name, final.name);
+      consistency = { status: "matched", reference: `${motion}-end.jpg`, ...difference };
+      if (difference.different) {
+        // Confirm the page is still before attributing the mismatch to the stream. No frame comparison can prove intermediate motion is correct.
+        await sleep(100);
+        const verification = await captureFrame("verification");
+        const stability = await frameDifference(final.name, verification.name);
+        consistency.status = stability.different ? "moving" : "mismatch";
+        if (!stability.different) {
+          const original = `record${name ? "-" + name : ""}-stream-end.jpg`;
+          writeFileSync(join(out, original), readFileSync(streamEnd.name));
+          consistency.original = original;
+          warnings.push(`录屏末帧与静止截图差异明显，可能没拍全；静止终态以 ${motion}-end.jpg 为准，已补为录像最后一帧，原末帧保留在 ${original}；过渡请单独重录：${currentRetryCommand} --hold 2000`);
+        }
+      }
+    }
     const feedback = await evaluate(`__oilRecordTiming.read()`);
     const issues = await check();
     await cdp("Page.stopScreencast");
@@ -1198,7 +1340,8 @@ async function record(url, w, h, { steps = [], name = "", entry = flags.has("ent
     if (final) {
       // The stream may deliver a frame from after --hold while checks are running.
       while (frames.length > 1 && frames.at(-1).t > finished) frames.pop();
-      frames.push(final);
+      // Plain recordings keep their original head/middle/tail samples when the two paths agree.
+      if (entry || lastAction >= 0 || consistency.different) frames.push(final);
     }
     const nearest = (time, pool = frames) => pool.reduce((best, f) => Math.abs(f.t - time) < Math.abs(best.t - time) ? f : best);
     let pick, sampling;
@@ -1220,26 +1363,26 @@ async function record(url, w, h, { steps = [], name = "", entry = flags.has("ent
     }
     for (const [k, f] of Object.entries(pick)) writeFileSync(join(out, `${motion}-${k}.jpg`), readFileSync(f.name));
     const frameReport = Object.fromEntries(Object.entries(pick).map(([k, f]) => [k, {
-      file: `${motion}-${k}.jpg`, timeMs: Math.max(0, Math.round((f.t - frames[0].t) * 1000)),
+      file: `${motion}-${k}.jpg`, source: f.source, timeMs: Math.max(0, Math.round((f.t - frames[0].t) * 1000)),
     }]));
-    const details = { frames: frameReport, sampling, durationMs: Math.round((finished - frames[0].t) * 1000) };
+    const details = { frames: frameReport, sampling, consistency, warnings, durationMs: Math.round((finished - frames[0].t) * 1000) };
     const ffmpeg = (await runFfmpeg(["-version"], 5000)).status === 0;
     if (!ffmpeg) return { issues, ...details, failed: true, message: `录屏：没装 ffmpeg，只留了 ${motion}-start/mid/end.jpg 三帧` };
     // Generated basenames are safe for concat's quoting, even when --out contains an apostrophe.
     // Keep the final still frame through the end of --hold; screencasts only emit changed frames.
-    const list = frames.map((f, i) => `file '${basename(f.name)}'\nduration ${Math.max(0.016, ((frames[i + 1]?.t ?? finished) - f.t)).toFixed(3)}`).join("\n") + `\nfile '${basename(frames.at(-1).name)}'\n`;
+    const list = screencastList(frames, finished);
     writeFileSync(join(dir, "list.txt"), list);
     const r = await runFfmpeg(["-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", join(dir, "list.txt"),
       "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30", "-pix_fmt", "yuv420p", join(out, video)], 60000);
-    if (r.status !== 0) return { issues, ...details, failed: true, message: `录屏：ffmpeg 合成失败（${r.error?.code === "ETIMEDOUT" ? "60 秒内没有合成完成" : r.error?.message || r.stderr.trim().split("\n").pop()}），已保留 ${motion}-start/mid/end.jpg 三帧` };
+    if (r.status !== 0) return { issues, ...details, failed: true, message: `录屏：ffmpeg 合成失败（${r.error?.code === "ETIMEDOUT" ? `${60 * timeoutScale} 秒内没有合成完成` : r.error?.message || r.stderr.trim().split("\n").pop()}），已保留 ${motion}-start/mid/end.jpg 三帧` };
     rmSync(dir, { recursive: true, force: true });
     return { issues, ...details, message: `录屏：${video}（${(finished - frames[0].t).toFixed(1)} 秒）和 ${motion}-start/mid/end.jpg` };
   } finally {
     const index = listeners.indexOf(onFrame); if (index >= 0) listeners.splice(index, 1);
-    try { if (!transportFailure) await cdp("Page.stopScreencast"); }
+    try { if (!transportFailure && !browserNeedsRestart) await cdp("Page.stopScreencast"); }
     finally {
       try {
-        if (!transportFailure) {
+        if (!transportFailure && !browserNeedsRestart) {
           await evaluate(`(window.__oilRecordTiming?.stop(), delete window.__oilRecordTiming, true)`);
           if (identifier) await cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier });
         }
@@ -1399,15 +1542,50 @@ saveFatalReport = (error) => {
   writeFileSync(join(out, "report.json"), JSON.stringify(report, null, 2));
 };
 const evidence = flags.has("evidence");
-// Evidence failures belong to individual items, so later items can still run.
-async function item(file, metadata, work) {
-  try { await during(file, work); }
-  catch (error) {
-    if (transportFailure) throw error;
-    report.push({ file, ...metadata, failed: true, issues: [...problems, error.message] });
-    if (!evidence) throw error;
-    lines.push(`${file}  ⚠ 失败：${error.message}`); process.exitCode = 1;
+// One completed item produces one stderr progress line; stdout keeps its existing summary.
+let completed = 0, progressTotal = 0;
+function progress(file, failed = false) {
+  console.error(`[${++completed}/${progressTotal}] ${file} ${failed === "skipped" ? "跳过，已记入报告" : failed ? "失败，已记入报告" : "完成"}`);
+}
+function skipped(file, metadata, reason) {
+  report.push({ file, ...metadata, skipped: true, issues: [reason] });
+  lines.push(`${file}  ⚠ 跳过：${reason}`); progress(file, "skipped");
+}
+function retryItem(file, metadata, extra = "") {
+  const group = groups.find((g) => g.id === (metadata.group || "") && !(evidence && file.endsWith(".png")));
+  const steps = group?.steps.length ? (group.id ? group.id + ": " : "") + group.steps.map((s) => s.raw).join("; ") : "";
+  const variant = file.endsWith("-masked.png") ? " --mask" : file.endsWith("-marked.png") ? ` --mark ${quoteArg(opt.mark)}` : file.endsWith("-compare.png") ? ` --compare ${quoteArg(refImage)}` : "";
+  const isSheet = file.endsWith(".png") && metadata.state === undefined && states.length > 1;
+  return retryCommand + ` --out ${quoteArg(out)}${metadata.size ? ` --size ${quoteArg(metadata.size)}` : ""}${metadata.zoom ? ` --zoom ${metadata.zoom}` : ""}` +
+    (metadata.state !== null && metadata.state !== undefined ? ` --states ${quoteArg(metadata.state)} --param ${quoteArg(opt.param)}` : "") +
+    (isSheet ? ` --states ${quoteArg(states.join(","))} --param ${quoteArg(opt.param)} --sheet` : "") + variant +
+    (opt.query ? ` --query ${quoteArg(opt.query)}` : "") + (steps ? ` --steps ${quoteArg(steps)}` : "") +
+    (file.startsWith("motion-probe") ? " --motion" : extra) + (flags.has("full") && file.endsWith(".png") ? " --full" : "");
+}
+async function item(file, metadata, work, extra = "") {
+  currentRetryCommand = retryItem(file, metadata, extra);
+  let failed = false;
+  const firstResult = report.length;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const previousLines = lines.length;
+    const reopened = browserNeedsRestart;
+    if (reopened) await restartBrowser();
+    try { await during(file, () => work(attempt > 0 || reopened)); break; }
+    catch (error) {
+      if (transportFailure) throw error;
+      if (error.code === "SCREENSHOT_TIMEOUT" && !attempt) {
+        lines.length = previousLines;
+        console.error(`shoot：${error.message}；正在重开浏览器重试 ${file} 一次`);
+        await restartBrowser(); continue;
+      }
+      report.push({ file, ...metadata, failed: true, issues: [...problems, error.message] });
+      lines.push(`${file}  ⚠ 失败：${error.message}`); process.exitCode = 1; failed = true;
+      // Ordinary one-item failures retain their old stderr diagnostic; batches can finish the rest.
+      console.error(`shoot：${error.message}`);
+      break;
+    }
   }
+  progress(file, failed || report.slice(firstResult).some((r) => r.failed));
 }
 async function captureBatch(selectedStates, selectedZooms, selectedGroups, useMask, useSheet) {
   for (const { w, h } of sizes) for (const zoom of selectedZooms) for (const group of selectedGroups) {
@@ -1418,44 +1596,62 @@ async function captureBatch(selectedStates, selectedZooms, selectedGroups, useMa
       const preferred = [stateIds[stateIndex], suffix].filter(Boolean).join("-");
       const name = reserveFamily(preferred, (stem) => [`${stem}.png`, ...(useMask ? [`${stem}-masked.png`] : []), ...(marks.length ? [`${stem}-marked.png`] : []), ...(refImage ? [`${stem}-compare.png`] : [])]);
       const meta = { state, size: `${w}x${h}`, zoom, ...(group.id ? { group: group.id } : {}) };
-      await item(`${name}.png`, meta, async () => {
+      const prepare = async () => {
         problems = [];
         await setViewport(w, h, zoom); await open(withState(state));
-        let animationWaitMs = await settleAnimations(2000);
+        let waited = await settleAnimations(2000);
         await runSteps(group.steps);
-        animationWaitMs += await settleAnimations(2000 - animationWaitMs);
-        const file = await screenshot(join(out, `${name}.png`), flags.has("full"));
+        waited += await settleAnimations(2000 - waited); return waited;
+      };
+      let entry;
+      const file = join(out, `${name}.png`);
+      await item(`${name}.png`, meta, async () => {
+        const animationWaitMs = await prepare();
+        await screenshot(file, flags.has("full"));
         const issues = await check(), hints = await lint();
-        const entry = { file: basename(file), ...meta, animationWaitMs, issues, lint: hints };
-        report.push(entry); shots.push({ path: file, label: state || "page" });
+        entry = { file: basename(file), ...meta, animationWaitMs, issues, lint: hints };
         lines.push(`${basename(file)}${issues.length ? "  ⚠ " + issues.join("；") : ""}${hints.length ? "  ◇ 默认做法提示：" + lintLine(hints) : ""}`);
-        if (marks.length) await item(`${name}-marked.png`, meta, async () => {
-          try { await mark(); lines.push(basename(await screenshot(join(out, `${name}-marked.png`), flags.has("full")))); }
-          finally { await unmark(); }
-        });
-        if (useMask) await item(`${name}-masked.png`, meta, async () => {
-          try {
-            await mask(); await sleep(60);
-            masked.push({ path: await screenshot(join(out, `${name}-masked.png`), flags.has("full")), label: state || "page" });
-            lines.push(`${name}-masked.png`);
-          } finally { await evaluate(`(document.getElementById("oil-mask")?.remove(), true)`); }
-        });
-        if (refImage) {
-          const result = await compare(file, refImage, join(out, `${name}-compare.png`));
-          entry.compare = { file: result.file, overall: result.overall, cells: result.cells }; lines.push(result.message);
+        report.push(entry); shots.push({ path: file, label: state || "page" });
+      });
+      if (!shots.some((shot) => basename(shot.path) === `${name}.png`)) {
+        for (const extra of [marks.length && "marked", useMask && "masked", refImage && "compare"].filter(Boolean)) {
+          skipped(`${name}-${extra}.png`, meta, `原截图 ${name}.png 失败，无法生成这一项`);
         }
+        continue;
+      }
+      if (marks.length) await item(`${name}-marked.png`, meta, async (retried) => {
+        if (retried) await prepare();
+        try { await mark(); lines.push(basename(await screenshot(join(out, `${name}-marked.png`), flags.has("full")))); }
+        finally { if (!browserNeedsRestart) await unmark(); }
+      });
+      if (useMask) await item(`${name}-masked.png`, meta, async (retried) => {
+        if (retried) await prepare();
+        try {
+          await mask(); await sleep(60);
+          masked.push({ path: await screenshot(join(out, `${name}-masked.png`), flags.has("full")), label: state || "page" });
+          lines.push(`${name}-masked.png`);
+        } finally { if (!browserNeedsRestart) await evaluate(`(document.getElementById("oil-mask")?.remove(), true)`); }
+      });
+      if (refImage) await item(`${name}-compare.png`, meta, async () => {
+        const result = await compare(file, refImage, join(out, `${name}-compare.png`));
+        entry.compare = { file: result.file, overall: result.overall, cells: result.cells }; lines.push(result.message);
       });
     }
-    if (useSheet && shots.length > 1) {
+    if (useSheet && selectedStates.length > 1) {
       const sheetSuffixParts = [group.id, sizes.length > 1 ? `${w}x${h}` : "", selectedZooms.length > 1 && zoom !== 1 ? `@${zoom}x` : ""].filter(Boolean);
       const preferred = `sheet${sheetSuffixParts.length ? "-" + sheetSuffixParts.join("-") : ""}`;
-      const sheetName = reserveFamily(preferred, (stem) => [`${stem}.png`, ...(masked.length > 1 ? [`${stem}-masked.png`] : [])]);
-      await item(`${sheetName}.png`, { size: `${w}x${h}`, zoom }, async () => {
+      const sheetName = reserveFamily(preferred, (stem) => [`${stem}.png`, ...(useMask ? [`${stem}-masked.png`] : [])]);
+      const meta = { size: `${w}x${h}`, zoom, ...(group.id ? { group: group.id } : {}) };
+      if (shots.length > 1) await item(`${sheetName}.png`, meta, async () => {
         lines.push(basename(await sheet(shots, join(out, `${sheetName}.png`), w, h)));
       });
-      if (masked.length > 1) await item(`${sheetName}-masked.png`, { size: `${w}x${h}`, zoom }, async () => {
-        lines.push(basename(await sheet(masked, join(out, `${sheetName}-masked.png`), w, h)));
-      });
+      else skipped(`${sheetName}.png`, meta, `只收到 ${shots.length} 张成功截图，并排图至少需要 2 张`);
+      if (useMask) {
+        if (masked.length > 1) await item(`${sheetName}-masked.png`, meta, async () => {
+          lines.push(basename(await sheet(masked, join(out, `${sheetName}-masked.png`), w, h)));
+        });
+        else skipped(`${sheetName}-masked.png`, meta, `只收到 ${masked.length} 张成功遮字图，并排图至少需要 2 张`);
+      }
     }
   }
 }
@@ -1479,10 +1675,16 @@ async function recording(group, entry, zoom, multipleZooms = false) {
     problems = [];
     const result = await record(withState(states[0]), sizes[0].w, sizes[0].h, { name, steps: group.steps, entry, zoom });
     lines.push(result.message);
-    report.push({ file, ...meta, issues: result.issues, frames: result.frames, sampling: result.sampling, durationMs: result.durationMs, ...(result.failed ? { failed: true } : {}) });
+    for (const warning of result.warnings || []) lines.push(`⚠ ${warning}`);
+    report.push({ file, ...meta, issues: result.issues, frames: result.frames, sampling: result.sampling, durationMs: result.durationMs, ...(result.consistency ? { consistency: result.consistency } : {}), ...(result.warnings?.length ? { warnings: result.warnings } : {}), ...(result.failed ? { failed: true } : {}) });
     if (evidence && result.failed) { report.at(-1).issues.push(result.message); process.exitCode = 1; }
-  });
+  }, ` --record${entry ? " --entry" : ""}`);
 }
+const shotCount = (n, z, g, mask, sheet) => sizes.length * z * g * (n * (1 + Number(mask) + Number(marks.length > 0) + Number(!!refImage)) + (sheet && n > 1 ? 1 + Number(mask) : 0));
+const batchMask = states.length > 1 || flags.has("mask");
+progressTotal = evidence
+  ? (suppliedOptions.has("zoom") ? shotCount(states.length, zooms.length, 1, batchMask, states.length > 1) : shotCount(states.length, 1, 1, batchMask, states.length > 1) + shotCount(1, 1, 1, flags.has("mask"), false)) + Math.max(1, groups.length) + 1 + groups.length
+  : (flags.has("motion") ? Math.max(1, groups.length) : 0) + (flags.has("record") ? zooms.length * Math.max(1, groups.length) : shotCount(states.length, zooms.length, Math.max(1, groups.length), flags.has("mask"), flags.has("sheet")));
 try {
   if (evidence) {
     const plain = [{ id: "", steps: [] }];
