@@ -172,11 +172,11 @@ def embed_local_files(content: str, base: Path, root: Path, used: set[Path]) -> 
     """Inline images, fonts and videos referenced relative to the candidate, as long as they stay inside the manifest folder."""
 
     def data_url(ref: str) -> str | None:
-        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:|^//", ref):
+        target = local_file(ref, base, root)
+        if target is None:
             return None
-        target = (base / ref.split("?")[0].split("#")[0]).resolve()
         mime = EMBEDDABLE.get(target.suffix.lower())
-        if not mime or not target.is_file() or not target.is_relative_to(root):
+        if not mime:
             return None
         used.add(target)
         return f"data:{mime};base64," + base64.b64encode(target.read_bytes()).decode("ascii")
@@ -201,7 +201,9 @@ def local_file(ref: str, base: Path, root: Path) -> Path | None:
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:|^//", ref):
         return None
     target = (base / ref.split("?")[0].split("#")[0]).resolve()
-    return target if target.is_file() and target.is_relative_to(root) else None
+    if not target.is_relative_to(root):
+        raise ValueError(f"引用了 manifest 目录以外的文件 {ref}；把文件复制进 manifest 目录或它的子目录，再更新相对路径")
+    return target if target.is_file() else None
 
 
 def inline_local_code(content: str, base: Path, root: Path, used: set[Path], interactive: bool) -> str:
@@ -292,6 +294,22 @@ def local_url(value: str, label: str) -> str:
 HEX_COLOR = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
 
 
+def native_viewport(value, where: str) -> dict:
+    """Normalize a fixed canvas without changing manifests that omit it."""
+    dimensions = None
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d+)\s*[xX×]\s*(\d+)\s*", value)
+        if match:
+            dimensions = [int(part) for part in match.groups()]
+    elif isinstance(value, dict):
+        dimensions = [value.get("width"), value.get("height")]
+    if dimensions and all(isinstance(n, (int, float)) and not isinstance(n, bool)
+                          and 0 < n <= 2**53 - 1 and n == int(n) for n in dimensions):
+        return dict(zip(("width", "height"), map(int, dimensions)))
+    raise ValueError(f'{where}nativeViewport 必须是正整数宽高；收到的是 {json.dumps(value, ensure_ascii=False)}；'
+                     '例如 "1920x1080"、"1920×1080" 或 {"width":1920,"height":1080}')
+
+
 def read_manifest(path: Path) -> dict:
     if not path.is_file():
         raise ValueError(f"找不到 manifest：{path}。先在任务目录里写好 manifest.json，字段见 references/style-explorer.md 的“准备输入”")
@@ -347,6 +365,12 @@ def load_manifest(path: Path) -> tuple[dict, set[Path]]:
     seen = set()
     inputs = {path, TEMPLATE.resolve()}
     output = []
+    viewport = None
+    if "nativeViewport" in raw:
+        affected = "、".join(str(c.get("id", i)) for i, c in enumerate(candidates, 1)
+                            if isinstance(c, dict) and "nativeViewport" not in c)
+        where = f"manifest（用于候选 {affected}）：" if affected else "manifest."
+        viewport = attempt(lambda: native_viewport(raw["nativeViewport"], where))
     for index, candidate in enumerate(candidates, 1):
         if not isinstance(candidate, dict):
             problems.append(f"第 {index} 个候选必须是对象")
@@ -364,6 +388,8 @@ def load_manifest(path: Path) -> tuple[dict, set[Path]]:
                 problems.append(f'候选 id "{identifier}" 重复了，每个候选要用不同的 id')
             seen.add(identifier)
         where = f"候选 {identifier}：" if identifier else f"第 {index} 个候选："
+        candidate_viewport = (attempt(lambda: native_viewport(candidate["nativeViewport"], where))
+                              if "nativeViewport" in candidate else viewport)
         kind = candidate.get("kind", "html")
         if kind not in ("html", "image", "url"):
             problems.append(f'{where}kind 只能是 "html"、"image" 或 "url"，收到的是 {json.dumps(kind, ensure_ascii=False)}')
@@ -382,7 +408,7 @@ def load_manifest(path: Path) -> tuple[dict, set[Path]]:
             if name:
                 source = (path.parent / name).resolve()
                 if not source.is_relative_to(path.parent):
-                    problems.append(f"{where}source 必须在 manifest 所在的目录里，收到的是 {name}")
+                    problems.append(f"{where}source 必须在 manifest 所在的目录里，收到的是 {name}；把文件复制进 manifest 目录或它的子目录，再更新相对路径")
                     source = None
                 elif not source.is_file():
                     problems.append(f"{where}找不到 source 文件 {name}（按 manifest 所在的目录 {path.parent} 找）")
@@ -413,6 +439,7 @@ def load_manifest(path: Path) -> tuple[dict, set[Path]]:
             "sourceLabel": url if kind == "url" else source.name,
             "baseline": baseline,
             "interactive": interactive,
+            **({"nativeViewport": candidate_viewport} if candidate_viewport else {}),
         })
     if sum(c["baseline"] for c in output) > 1:
         problems.append("最多只能有一个基线候选（baseline: true）")
@@ -474,17 +501,43 @@ def build(manifest: Path, output: Path, *, force: bool = False) -> dict:
 
 HELP_EPILOG = """\
 用法示例：
-  python3 build_explorer.py <任务目录>/manifest.json
-      生成 <任务目录>/style-explorer.html；已有同名文件时加 --force 覆盖。
+  python3 build_explorer.py <manifest 所在目录>/manifest.json
+      生成 <manifest 所在目录>/style-explorer.html；已有同名文件时加 --force 覆盖，
+      或用 --output 换一个文件名。
 
 manifest.json 最少要有：
   {"schemaVersion": 1, "project": "<项目名>", "brief": "<所有候选共同的内容与任务>",
    "candidates": [{"id": "a", "name": "<方向名>", "concept": "<一句体验意图>",
      "typography": "<实际使用的字体关系>", "palette": ["#112233", "#f5f5f5"],
-     "traits": ["<看得见的特征>"], "kind": "html", "source": "a.html"}]}
-  kind 还可以是 "image"（source 指向 PNG、JPEG 或 WebP）或 "url"（用 url 字段指向本机开发服务器）。
-  全部字段见 references/style-explorer.md 的“准备输入”。
+     "traits": ["<看得见的特征>"], "source": "a.html"}]}
 
+可选字段：
+  lang              顶层。"zh" 或 "en"，只决定对比页外壳的语言；省略时按浏览器语言。
+  round             顶层。轮次，例如 "01"，会出现在用户复制的选择里。
+  nativeViewport    固定画布的原生视口。写在顶层对所有候选生效，写在候选里只对它生效。
+                    认 "1920x1080"、"1920×1080" 和 {"width": 1920, "height": 1080}。
+                    省略时用默认视口：桌面 1280×900，手机 390×844。
+  kind              候选。"html"（默认）、"image"（source 指向 PNG、JPEG 或 WebP），
+                    或 "url"（用 url 字段代替 source，指向本机开发服务器上的页面，
+                    只认 localhost、127.0.0.1 和 ::1）。
+  serve             顶层。有 url 候选时写下启动方式：
+                    {"command": "<启动命令>", "cwd": "<项目的绝对路径>", "url": "<服务地址>"}
+  interactive       候选。true 表示可操作的小样：单个 HTML，脚本内联。它不能联网，
+                    也不能加载外部文件；浏览器存储在页面关闭后清空；alert、confirm
+                    这类系统弹窗不会出现，需要确认时用页面内的对话框。
+  baseline          候选。true 表示现状，排在第一位，编号显示为“现状”，每轮最多一个。
+
+候选文件的要求：
+  候选和它引用的图片、字体、视频，都放在 manifest 所在的目录或它的子目录里，
+  用相对于候选文件的路径引用，生成器会把它们内嵌进对比页；不引用网络资源。
+  HTML 候选是带 head 的完整文档，CSS 写在页面里；不运行脚本也要显示出内容
+  （interactive 和 url 候选除外）。
+  不认 iframe、object、embed，也不认 srcset 和 <picture><source>：
+  改成一张用相对路径引用的 <img>，或者直接用截图做图片候选。
+  id 用小写字母、数字、连字符或下划线，不重复；palette 用十六进制色值。
+
+需要 Python 3.10 或更新版本。产物不能写进 Skill 目录。Skill 更新以后，
+已经生成的对比页不会跟着变，用原来的 manifest 加 --force 重新生成。
 写错时会把 manifest 里所有要改的地方一次列出来，旧的对比页不会被改动。
 成功时在标准输出打印一行 JSON：output、candidates、fingerprint、bytes。"""
 
