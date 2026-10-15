@@ -38,20 +38,20 @@ node <skill>/scripts/shoot.mjs <页面地址或 HTML 文件> [选项]
 
 ```text
 node <skill>/scripts/curate-media.mjs search "<关键词>" --kind texture --limit 6 --sheet --dir candidates
+node <skill>/scripts/curate-media.mjs search "<一组词> | <另一组词>" --sheet --dir candidates
 node <skill>/scripts/curate-media.mjs preview V1,T2 --sheet --dir candidates
-node <skill>/scripts/curate-media.mjs fetch V1,T2 --dir assets --sheet
+node <skill>/scripts/curate-media.mjs fetch C1,T2 --dir assets --sheet
+node <skill>/scripts/curate-media.mjs fetch V3 --dir <不上线的参考图目录>
 node <skill>/scripts/curate-media.mjs fetch T2 --maps all --resolution 1k --dir assets
 ```
 
-`--kind` 支持 `all|texture|design|photo|blueprint|map|plate|science|video`。Poly Haven 提供材质与模型预览，V&A 提供设计馆藏，LOC 提供历史摄影、测绘蓝图与古地图，Wellcome 提供版画与科学手稿，NASA 提供科技照片与视频。`all` 交错取各信源，`--limit` 是总结果数。
+`--kind` 支持 `all|texture|design|photo|blueprint|map|plate|science|video`。Poly Haven 提供材质与模型，Met、AIC、Cleveland、Rijksmuseum、V&A 和 Japan Search（日本国立博物馆、国会图书馆等，东亚题材可直接用中日文搜，简体搜不到换繁体或日文写法）提供馆藏器物与版画，Wikimedia Commons、LOC、Wellcome 和 NASA 提供摄影、测绘蓝图、古地图、科学手稿与视频。`all` 交错取各信源；用 `|` 可一次搜几组词，不含关键词的条目会被滤掉。
 
-搜索返回 JSON，`T/V/L/W/N` 编号依次对应五个信源，存入当前目录 `.curate-cache.json`，跨次搜索保留。后续命令在同一目录运行，或传同一个 `--cache <路径>`。错误单独列出，正常零匹配与请求失败分开报告。
+结果存入 `.curate-cache.json`，编号首字母对应信源（T/V/L/W/N/C/M/A/K/J/R），跨次搜索保留。每项 `use` 说明用途：`page` 可放进页面（CC BY/BY-SA 要署名），`check` 先看来源页，`reference` 不能放进页面；`--use page` 只留第一种。
 
-`search --sheet` 和 `preview` 出 HTML 候选联系表，打开后显示预览尺寸；`fetch --sheet` 出本地联系表并检查真实宽高、完整解码。视频自动截首帧 poster；检查和 poster 需要 ffmpeg/ffprobe，缺少时保留下载并报告未完成项。视频尺寸、版本回退及超时选项见 `--help`。
+`search --sheet` 和 `preview` 出带编号、用途和原图尺寸的联系表 PNG，直接读这张图挑选，不要只看标题；同时给每项算 `look`（明暗、是否近单色、四边平均色与平整度、是否浅色纸底、哪些区域干净可压字）并出 HTML 联系表。`fetch --sheet` 出本地联系表并检查真实宽高、完整解码；视频自动截首帧 poster。
 
-贴图默认下载 1k Diffuse，`--maps all` 拉取 Diffuse、Roughness、OpenGL Normal JPG，并校验大小与 MD5。模型默认下载渲染预览，搜索另给 glTF 依赖清单。贴图使用与素材许可见 [配图](media.md#真实贴图与科学工程素材)。
-
-仍兼容 `fetch "<媒体 URL>" --out assets/<文件名> --note "来源说明"`。成功下载及 poster 自动写入同目录 `SOURCES.md`，已有文件不会覆盖；URL 权利资料缺失时记为未核实。全部选项、输出和修正示例：`node <skill>/scripts/curate-media.mjs --help`。
+贴图默认下载 1k Diffuse，`--maps all` 拉取 Diffuse、Roughness、OpenGL Normal JPG 并校验大小与 MD5；使用与许可见 [配图](media.md#真实贴图与科学工程素材)。下载及 poster 自动写入同目录 `SOURCES.md`，兼容 `fetch "<URL>" --out assets/<文件名> --note "来源说明"`。全部选项见 `node <skill>/scripts/curate-media.mjs --help`。
 
 ### 看结果
 
