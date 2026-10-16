@@ -327,6 +327,35 @@ def embed_css(css: str, base: Path, root: Path, used: set[Path], stack: tuple[Pa
     return apply_edits(css, edits)
 
 
+def widest_candidate(srcset: str) -> str | None:
+    """Largest "url 1200w" / "url 2x" entry of a srcset; an entry without a descriptor counts as 1x.
+
+    Parsed as the HTML spec does: a URL runs to the next whitespace, so data URLs keep their commas.
+    """
+    best, best_size, i, n = None, -1.0, 0, len(srcset)
+    while i < n:
+        while i < n and (srcset[i].isspace() or srcset[i] == ","):
+            i += 1
+        start = i
+        while i < n and not srcset[i].isspace():
+            i += 1
+        url, descriptor = srcset[start:i], ""
+        if url.endswith(","):
+            url = url.rstrip(",")
+        else:
+            start = i
+            while i < n and srcset[i] != ",":
+                i += 1
+            descriptor = srcset[start:i].strip()
+        try:
+            size = float(descriptor[:-1]) if descriptor[-1:] in ("w", "x") else 1.0
+        except ValueError:
+            size = 1.0
+        if url and size > best_size:
+            best, best_size = url, size
+    return best
+
+
 HTML_ATTR = re.compile(r"""(?P<lead>\s+(?P<name>[^\s=/>]+)\s*=\s*)(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+))""")
 
 
@@ -385,6 +414,14 @@ class LocalAssets(HTMLParser):
             if self.shell and tag == "a" and name == "href":
                 return match.group()  # Template navigation is not an offline resource dependency.
             ref = unescape(next(match[group] for group in ("double", "single", "bare") if match[group] is not None))
+            has_src = bool((attrs.get("src") or "").strip())
+            if name == "src" and tag == "img" and not has_src and widest_candidate(attrs.get("srcset") or ""):
+                return ""  # An empty src gives way to the srcset candidate below, so the tag keeps one src.
+            if name == "srcset" and tag == "img":
+                # The page shows one fixed size, so one file is enough: keep src, or take the widest candidate.
+                if has_src or not widest_candidate(ref):
+                    return ""
+                return match["lead"].replace(match["name"], "src") + '"' + escape(resource_url(widest_candidate(ref), self.base, self.root, self.used), quote=True) + '"'
             if name == "style":
                 result = embed_css(ref, self.base, self.root, self.used)
             elif name in ("src", "poster", "data", "href", "xlink:href"):
@@ -770,7 +807,7 @@ manifest.json 最少要有：
   单文件上限 20 MiB，输入文件总量上限 100 MiB；不引用网络资源。
   HTML 缺少 head 时自动补上；不运行脚本也要显示出内容
   （interactive 和 url 候选除外）。
-  不认 iframe、object、embed，也不认 srcset 和 <picture><source>：
+  img 的 srcset 只取一张：有 src 用 src，否则取最宽的那张。不认 iframe、object、embed 和 <picture><source>：
   改成一张用相对路径引用的 <img>，或者直接用截图做图片候选。
   id 用小写字母、数字、连字符或下划线，不重复；palette 推荐用十六进制色值数组，
   也能从描述文字中提取颜色，一个有效色值都没有时才报错。

@@ -606,6 +606,49 @@ console.log(JSON.stringify(result));
         self.assertIn('#dot"', content)
         self.assertNotIn("图%20片.png", content)
 
+    def test_img_srcset_keeps_src_or_takes_the_widest_candidate(self):
+        (self.folder / "small.png").write_bytes(b"small")
+        (self.folder / "large.png").write_bytes(b"large-image")
+        cases = {
+            '<img src="small.png" srcset="small.png 600w, large.png 1200w" alt="">': b"small",
+            '<img srcset="small.png 600w, large.png 1200w" alt="">': b"large-image",
+            '<img srcset="large.png 2x, small.png" alt="">': b"large-image",
+        }
+        for tag, expected in cases.items():
+            with self.subTest(tag=tag):
+                self.source.write_text(f"<html><head></head><body>{tag}</body></html>", encoding="utf-8")
+                builder.build(self.manifest, self.output, force=True)
+                content = self.payload(self.output.read_text(encoding="utf-8"))["candidates"][0]["content"]
+                self.assertNotIn("srcset", content)
+                self.assertEqual(content.count("data:image/png;base64,"), 1)
+                self.assertIn('src="data:image/png;base64,' + base64.b64encode(expected).decode(), content)
+        # A data URL keeps its commas, and an empty src gives way instead of leaving two src attributes.
+        inline = "data:image/png;base64,QUFB,QkI="
+        for tag, expected in {f'<img srcset="{inline} 2x, small.png 1x" alt="">': inline,
+                              '<img src="" srcset="large.png 1200w" alt="">': "data:image/png;base64," + base64.b64encode(b"large-image").decode()}.items():
+            with self.subTest(tag=tag):
+                self.source.write_text(f"<html><head></head><body>{tag}</body></html>", encoding="utf-8")
+                builder.build(self.manifest, self.output, force=True)
+                content = self.payload(self.output.read_text(encoding="utf-8"))["candidates"][0]["content"]
+                img = re.search(r"<img[^>]*>", content)[0]
+                self.assertEqual(re.findall(r'\ssrc="([^"]*)"', img), [expected])
+                self.assertNotIn("srcset", img)
+
+    def test_shell_secondary_text_meets_body_contrast(self):
+        template = (ROOT / "assets" / "style-explorer.html").read_text(encoding="utf-8")
+        tokens = dict(re.findall(r"--(canvas|well|faint|soft):(#[0-9a-f]{6})", re.search(r":root\{([^}]*)\}", template)[1]))
+
+        def luminance(color):
+            channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            channels = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+            return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+        for text in ("faint", "soft"):
+            for ground in ("canvas", "well"):
+                with self.subTest(text=text, ground=ground):
+                    high, low = sorted((luminance(tokens[text]), luminance(tokens[ground])), reverse=True)
+                    self.assertGreaterEqual((high + 0.05) / (low + 0.05), 4.5)
+
     def test_resource_examples_in_text_comments_and_scripts_stay_unchanged(self):
         example = '<img src="missing.png"> url(missing.png)'
         self.source.write_text(f'<html><head><style>/* url(missing.png) */ p::after{{content:\'url(missing.png)\'}}</style></head>'
