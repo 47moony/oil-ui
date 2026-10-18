@@ -23,9 +23,9 @@ node <skill>/scripts/shoot.mjs <页面地址或 HTML 文件> [选项]
 
 | 要什么 | 加上 |
 | --- | --- |
-| 看一眼桌面效果 | `--size desktop`；不写时是手机 390x844 |
+| 看一眼桌面效果 | `--size desktop`；不写时是手机 390x844；只看整体版式可加 `--thumb`（0.5 倍速截） |
 | 操作几步再截 | `--steps "click .open; wait 300"` |
-| 送评审或交付前取证 | `--evidence --states idle,done --steps "send: click .send"` |
+| 送评审或交付前取证 | `--evidence --states idle,done --steps "send: click .send"`（汇总末行直接打印评审手册与证据目录路径） |
 | 落地页录一段从头滚到底 | `--record --steps "scroll 600; scroll 600; scroll 600"`，按页面长度多写几步 |
 | 截图还原：和参考图比对 | `--compare 参考.png --size <参考的逻辑尺寸>` |
 | 给用户指出问题：在元素上画框、标编号 | `--mark "1=.page-head .btn; 2=.toggle-row" --full` |
