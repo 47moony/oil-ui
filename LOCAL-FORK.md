@@ -16,13 +16,19 @@
 - frontmatter `description` 里的 “已安装 oil-ui-pro 时交给 oil-ui-pro”：是路由说明不是广告
 - README 里的 Pro 章节：不影响 skill 行为，留着减少合并冲突面
 
+## Remotes
+
+- `origin` → `47moony/oil-ui`（你的 fork，本地 main 已跟踪并推送）
+- `upstream` → `oil-oil/oil-ui`（官方仓库，只用于拉更新）
+
 ## 手动更新上游
 
 ```powershell
 cd C:\Users\Administrator\.cc-switch\skills\oil-ui
-git fetch origin
-git log --oneline HEAD..origin/main      # 看上游新增
-git merge origin/main                  # 冲突只可能落在 SKILL.md 被删段落附近
+git fetch upstream
+git log --oneline HEAD..upstream/main    # 看上游新增
+git merge upstream/main                  # 冲突只可能落在 SKILL.md 被删段落附近
+git push origin main                     # 合并完同步回 fork
 ```
 
 合并后复查：若上游重写了被删段落，`git diff` 时确认更新检查/广告逻辑没有借尸还魂。
