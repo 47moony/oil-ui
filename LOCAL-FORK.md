@@ -2,6 +2,12 @@
 
 本地净化分支：在上游 `main` 之上删除了联网与营销行为，其余逻辑未动。
 
+## 上游同步
+
+- 净化起点：上游 `v0.23.8`（`feb1f95`）。
+- 已同步：合并提交 `2fb6877` 将 `upstream/main` 并入，现基线为 **`v0.29.1`（`29085f1`）**。合并后复查——`allowed-tools`、版本检查段、`recommend_once.py` 完整版提示、`Oil UI Pro` 推销句、`oil-tone` 推荐均未复活；`scripts/check_update.{py,sh}`、`scripts/recommend_once.py`、`tests/test_check_update.py` 仍不存在。
+- 待定：上游此轮新增 `scripts/oiloil-image.mjs`（调 `ui.oiloil.org` 用官方积分生图，SKILL.md 步骤 1 有条件引用，无生图能力时静默降级）。属「生图新功能」而非更新检查/营销，暂未净化，是否剥离待定。
+
 ## 删除内容（相对上游 v0.23.8, feb1f95）
 
 - `SKILL.md` frontmatter 的 `allowed-tools`（仅服务于更新检查脚本）
