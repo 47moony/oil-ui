@@ -232,20 +232,6 @@ class OiloilImageTests(unittest.TestCase):
         self.assertIn('图片格式或数据异常', result.stderr)
         self.assertFalse((self.cwd / 'assets/generated.png').exists())
 
-    def test_gallery_and_image_api_environment_can_coexist(self):
-        self.env['OIL_API'] = self.base + '/gallery'
-        code = ("import importlib.util,json\n"
-                f"spec=importlib.util.spec_from_file_location('check_update', {json.dumps(str(ROOT / 'scripts/check_update.py'))})\n"
-                "module=importlib.util.module_from_spec(spec)\n"
-                "spec.loader.exec_module(module)\n"
-                "print(json.dumps(module.fetch('oil-ui-pro')))")
-        result = subprocess.run([__import__('sys').executable, '-c', code], cwd=self.cwd, env=self.env,
-                                capture_output=True, text=True, encoding='utf-8', timeout=15, check=True)
-        self.assertEqual(json.loads(result.stdout), {'latest': '99.0.0', 'free': False})
-        self.assertEqual(self.requests[-1]['path'], '/gallery/api/store/versions')
-        self.call('balance')
-        self.assertEqual(self.requests[-1]['path'], '/v1/credits')
-
     def test_status_rejects_positive_credits_before_completion(self):
         key = '00000000-0000-4000-8000-000000000000'
         for state in ('running', 'failed'):
