@@ -23,6 +23,10 @@
 - frontmatter `description` 里的 “已安装 oil-ui-pro 时交给 oil-ui-pro”：是路由说明不是广告
 - README 里的 Pro 章节：不影响 skill 行为，留着减少合并冲突面
 
+## 运行环境
+
+- 上游 ≥v0.30 的 `scripts/shoot.mjs` 要求 **Node ≥22**。本机 `C:\Program Files\nodejs` 是 v20，已在系统 PATH 中把 fnm 的 `aliases\default` 软链目录插到 nodejs 之前——`node` 现解析为 fnm 默认 v22.23.4，跟随 `fnm default` 切换。回滚：删掉 Machine PATH 里该段（旧值备份 `%TEMP%\machine-path-backup.txt`）。
+
 ## Remotes
 
 - `origin` → `47moony/oil-ui`（你的 fork，本地 main 已跟踪并推送）
